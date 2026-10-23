@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 打包产物
+build/
+dist/
+*.exe
+*.pkg
+*.zip
+
+# 报告、文档与个人信息相关文件
+*.doc
+*.docx
+*.pdf
+~$*
+gen_report.py
+
+# 报告素材（封面校名标识、运行截图）
+assets/
+运行截图/
+
+# 日志与临时文件
+*.log
+*.tmp
