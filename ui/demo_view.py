@@ -144,6 +144,7 @@ class DemoView(QWidget):
         self._replay_shapes = []      # 正在"从无到有"回放的图元（回放中隐藏）
         self._replay_source = []      # 当前步骤流的来源图元（重放前重新隐藏）
         self._keep_overlay_at_finish = False   # 对比页：播完保留双色结果叠层
+        self._ref_pixels = []         # 变换页初始态像素（橙色参照层）
         self._had_hidden = False
         self._applied_index = -2      # 叠层已应用到的步（-2 = 未应用）
         self._all_pages = []          # [DemoSpec]
@@ -235,8 +236,9 @@ class DemoView(QWidget):
         cn = "一二三四五六七八"
         for m in all_modules():
             title = f"模块{cn[m.order - 1]} · {m.name}"
-            section = CollapsibleCard(
-                title, expanded=(m.status in ("done", "current")), flat=True)
+            # 目录默认全部收起（用户指定）：进演示模式先看模块全貌，
+            # 需要哪一模块的演示页再点标题展开
+            section = CollapsibleCard(title, expanded=False, flat=True)
             if m.status == "future":
                 section.header.setEnabled(False)
                 section.header.setText(title + " — 下章解锁")
@@ -336,11 +338,11 @@ class DemoView(QWidget):
         self.card_play = CollapsibleCard("播放控制")
         lay.addWidget(self.card_play)
         play_lay = self.card_play.body_lay
-        # 选择图元：切到选择/移动工具（箭头），点选某个图元后可拖动/微调
+        # 选择图元：切到二维变换工具（箭头），点选某个图元后可拖动/微调
         self.btn_select = QPushButton("  选择图元")
         self.btn_select.setIcon(icon("cursor", size=15))
         self.btn_select.setToolTip(
-            "选择/移动工具：点击选中图元，重播/播放即演示它；"
+            "二维变换工具：点击选中图元，重播/播放即演示它；"
             "再按住拖动移动，方向键微调 1 格")
         self.btn_select.setCursor(Qt.PointingHandCursor)
         self.btn_select.clicked.connect(self._activate_select)
@@ -388,7 +390,7 @@ class DemoView(QWidget):
         slabel.setObjectName("secondary")
         srow.addWidget(slabel)
         self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(5, 240)
+        self.speed_slider.setRange(1, 240)
         self.speed_slider.setValue(60)
         self.speed_slider.valueChanged.connect(
             lambda v: (self.player.set_fps(v),
@@ -481,6 +483,10 @@ class DemoView(QWidget):
         self._sync_tool(demo)
 
         self._restore_replay_shapes()  # 切页前恢复上一轮回放的图元显示
+        # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢
+        self.canvas.demo.set_accumulate(getattr(demo, "trails", True))
+        if hasattr(self, "speed_slider"):
+            self.speed_slider.setValue(int(getattr(demo, "default_fps", 60)))
         skip = getattr(self, "_skip_next_regen", False)
         self._skip_next_regen = False
         if regenerate and not skip:
@@ -526,6 +532,10 @@ class DemoView(QWidget):
         """
         kind_algo = self.PAGE_TOOL.get(type(demo).__name__)
         if kind_algo is None:
+            # 模块自描述钩子：新模块不必让演示壳认识它的类
+            selector = getattr(demo, "tool_selector", None)
+            if selector is not None:
+                selector(self.canvas)
             return
         kind, algo = kind_algo
         if kind == "compare":
@@ -600,6 +610,22 @@ class DemoView(QWidget):
         只存在于叠层上，清掉就只剩一种颜色（用户反馈）。
         """
         if self._replay_shapes:
+            if hasattr(self.current_demo, "subject_kind"):
+                # 裁剪页：播完撤掉演示叠层、恢复原件——播放只做原理演示，
+                # 不动画布；真正的挖除由 Enter 完成（可撤销）
+                self._keep_overlay_at_finish = False
+                self.canvas.demo.reset()
+                self.canvas.demo.clear_reference()
+                self._restore_replay_shapes()
+                return
+            if callable(getattr(self.current_demo, "reference_pixels", None)):
+                # 变换页：终帧定格为实色，并清除橙色初始态参考层——
+                # 到达最终状态后初始状态消失，画面只剩终态；来源图元
+                # 继续保持隐藏，等下次重播/换页再恢复
+                self._keep_overlay_at_finish = False
+                self.canvas.demo.solidify()
+                self.canvas.demo.clear_reference()
+                return
             if self._keep_overlay_at_finish:
                 self._keep_overlay_at_finish = False
                 self.canvas.demo.solidify()     # 定格为不透明实色（与直线对比观感一致）
@@ -609,13 +635,13 @@ class DemoView(QWidget):
             self._restore_replay_shapes()
 
     def _activate_select(self):
-        """播放控制的"选择图元"按钮：切到选择/移动工具（箭头）。
+        """播放控制的"选择图元"按钮：切到二维变换工具（选择/移动已合并）。
 
         点击选中某个图元 → 再按住拖动移动 / 8 方位手柄缩放 /
         方向键微调 1 格（均为画布既有能力，此处只是给演示模式一个入口）。
         """
-        from modules.module02_primitives.tools import SelectMoveTool
-        self.canvas.set_tool(SelectMoveTool(self.canvas))
+        from modules.module03_transform2d.tools import Transform2DTool
+        self.canvas.set_tool(Transform2DTool(self.canvas))
         self.progress_label.setText(
             "选择模式：点击图元选中（重播/播放即演示它），"
             "再按住拖动移动，方向键微调 1 格")
@@ -629,6 +655,8 @@ class DemoView(QWidget):
         """
         s = getattr(self.canvas, "_selected_shape", None)
         if s is None or not self._is_canvas_page():
+            return False
+        if getattr(self.current_demo, "freehand_replay", True) is False:
             return False
         from core.shapes import RasterFillShape
         if isinstance(s, RasterFillShape):
@@ -730,6 +758,7 @@ class DemoView(QWidget):
             return                # 无画板交互页没有步骤流，参数即画面
         # 页内算法下拉切换 → 画布工具算法即时跟随（直线/圆/填充皆然）
         self._sync_tool(self.current_demo)
+        self._restore_replay_shapes()   # 上一轮播放隐藏的来源先恢复，避免残留
         # 填充对比必须先有用户选定的封闭图形：没有就不生成任何步骤
         # （不再回落内置示例多边形，用户明确要求对自己画的图形做对比）
         if isinstance(self.current_demo, CompareDemo) and \
@@ -752,8 +781,16 @@ class DemoView(QWidget):
         self.player.pause()
         self.canvas.demo.reset()
         self._applied_index = -1
-        self._replay_source = []      # 参数生成的步骤没有实体来源图元
-        self._keep_overlay_at_finish = False
+        # 变换演示页：来源 = 画布上选中/最后一个图元；播放时由 demo_view
+        # 隐藏原件（帧接管），播完恢复原件并定格终帧。参数生成页无来源。
+        getter = getattr(self.current_demo, "playback_source", None)
+        src = getter() if callable(getter) else None
+        self._replay_source = [src] if src is not None else []
+        self._keep_overlay_at_finish = src is not None
+        # 变换演示页：先取初始态像素，播放时作橙色参照层常显
+        ref_getter = getattr(self.current_demo, "reference_pixels", None)
+        self._ref_pixels = (ref_getter() if callable(ref_getter) else []) \
+            if steps else []
         self.player.load(steps)
         # 公式卡/监视器说明随算法刷新（如直线页 DDA⇄Bresenham 切换）
         self.formula_label.setText(_rich_text(self.current_demo.formula))
@@ -761,7 +798,8 @@ class DemoView(QWidget):
         self.monitor.clear()
         self._update_progress(-1)
         if not steps:
-            self.progress_label.setText("无输出（检查参数）")
+            self.progress_label.setText(
+                getattr(self.current_demo, "empty_hint", "") or "无输出（检查参数）")
             return
         if fit:
             # 主动选页时才对准生成范围（步骤像素是模拟像素坐标 → ×SIM）
@@ -780,6 +818,7 @@ class DemoView(QWidget):
             self._applied_index = -1
             self.monitor.clear()
             self._update_progress(-1)
+            self._sync_reference(index)
             return
         if incremental and index == self._applied_index + 1:
             step = steps[index]
@@ -793,12 +832,30 @@ class DemoView(QWidget):
         step = steps[index]
         self.monitor.update_values(step.values, step.note)
         self._update_progress(index)
+        self._sync_reference(index)
+
+    def _sync_reference(self, index: int):
+        """变换演示页：播放/单步期间常显初始态（橙色参照层），
+        到达末帧时清除——初始状态消失，画面只留终态（用户指定）。"""
+        getter = getattr(self.current_demo, "reference_pixels", None)
+        if not callable(getter):
+            return
+        steps = self.player.steps
+        if 0 <= index < len(steps) - 1 and self._ref_pixels:
+            self.canvas.demo.set_reference(self._ref_pixels, theme.WARNING)
+        else:
+            self.canvas.demo.clear_reference()
 
     def _step_color(self, step) -> str:
         return step.values.get("color", theme.ACCENT)
 
     def _on_state_changed(self, playing: bool):
         self.btn_play.setIcon(icon("pause" if playing else "play", size=17))
+        if playing and hasattr(self.current_demo, "playback_source"):
+            # 变换演示页：开播即清掉选中框/手柄，并隐藏来源图元——
+            # 画面上只剩逐帧被矩阵变换的轨迹，而不是"原件站着+克隆在动"
+            self.canvas.set_selection([])
+            self._rehide_for_replay()
 
     def _update_progress(self, index: int):
         n = len(self.player.steps)
@@ -818,16 +875,37 @@ class DemoView(QWidget):
     def _is_canvas_page(self) -> bool:
         return getattr(self.current_demo, "kind", "canvas") == "canvas"
 
+    def _transform_source_changed(self) -> bool:
+        """变换演示页：当前选中对象与已生成步骤的来源不同 → 需重生成。"""
+        getter = getattr(self.current_demo, "playback_source", None)
+        if not callable(getter):
+            return False
+        src = getter()
+        return (src is not None
+                and src is not getattr(self.current_demo, "_pinned_source", None))
+
+    def _clip_window_changed(self) -> bool:
+        """裁剪演示页：画布上拖出/调整过窗口 → 步骤流需按新窗口重生成。"""
+        fn = getattr(self.current_demo, "consume_dirty", None)
+        return bool(fn()) if callable(fn) else False
+
     def _ensure_generated(self):
         """无步骤时按当前参数生成（不自动播放）——播放类按钮的前置。"""
-        if not self.player.steps and self._is_canvas_page():
+        if self._is_canvas_page() and \
+                (not self.player.steps or self._clip_window_changed()):
             self._regenerate(fit=False, autoplay=False)
 
     def play_pause(self):
         """空格/K/播放按钮：选中图元优先（操控谁就演示谁）；无步骤先生成
         再播放（fit=True 自动把视图对准生成内容）；有步骤则暂停/继续；
         播完再按 = 从头播放，先撤销最终画面。"""
+        if self._clip_window_changed():
+            self._regenerate(fit=True, autoplay=True)
+            return
         if not self.player.steps and self._is_canvas_page():
+            self._regenerate(fit=True, autoplay=True)
+            return
+        if self._transform_source_changed():
             self._regenerate(fit=True, autoplay=True)
             return
         if self._replay_selected():
@@ -836,7 +914,13 @@ class DemoView(QWidget):
         self.player.toggle()
 
     def replay(self):
+        if self._clip_window_changed():
+            self._regenerate(fit=True, autoplay=True)
+            return
         if self._replay_selected():     # 选中图元优先：按它当前几何回放
+            return
+        if self._transform_source_changed():
+            self._regenerate(fit=True, autoplay=True)
             return
         if not self.player.steps and self._is_canvas_page():
             self._regenerate(fit=True, autoplay=True)
@@ -853,8 +937,16 @@ class DemoView(QWidget):
         self.player.step_forward()
 
     def to_end(self):
+        if self._clip_window_changed():
+            self._regenerate(fit=True, autoplay=False)
+            self.player.to_end()
+            return
         if self._replay_selected():     # 选中图元优先：生成后跳到末帧
             self.player.pause()
+            self.player.to_end()
+            return
+        if self._transform_source_changed():
+            self._regenerate(fit=True, autoplay=False)
             self.player.to_end()
             return
         if not self.player.steps and self._is_canvas_page():
@@ -875,6 +967,13 @@ class DemoView(QWidget):
         if not self.isVisible():        # 应用模式下绘制不触发回放
             return
         self._keep_overlay_at_finish = False   # 非对比路径播完照常清叠层
+        # 钩子：模块自带画布交互（如变换/裁剪演示页自己处理提交）
+        on_commit = getattr(self.current_demo, "on_commit", None)
+        if on_commit is not None:
+            on_commit(self, shapes)
+            return
+        if getattr(self.current_demo, "freehand_replay", True) is False:
+            return                        # 本页不做"手绘→算法回放"
         if isinstance(self.current_demo, FillDemo):
             self._handle_fill_page_commit(shapes)
             return

@@ -14,7 +14,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from PySide6.QtGui import QColor
 
 # ------------------------------------------------------------------
@@ -43,43 +43,132 @@ KIND_POLYGON        = "polygon"
 
 
 # ------------------------------------------------------------------
-# 几何参数的平移 / 快照（选择移动工具与 MoveShapeCommand 共用）
+# 几何变换 / 快照（选择移动工具与命令栈共用）
 # ------------------------------------------------------------------
-def translate(shape: "Shape", dx: int, dy: int):
-    """把图元几何参数整体平移（就地修改）。"""
+# 统一走 algorithms/transform2d.py 的仿射矩阵，避免每种图元各写一套
+# 平移/缩放公式；旋转、非等比缩放、错切以后都复用同一入口。
+from algorithms import transform2d as tf
+
+
+def _round_point(p) -> Tuple[int, int]:
+    """浮点坐标 → 模拟像素整数坐标（四舍五入）。"""
+    return int(round(p[0])), int(round(p[1]))
+
+
+def _map_erased(shape: "Shape", m: tf.Mat3):
+    """擦除掩码跟随几何一起变换（否则移动后擦除洞会留在原地）。"""
+    if shape.erased:
+        shape.erased = {_round_point(tf.apply(m, p)) for p in shape.erased}
+
+
+def _replace_circle_with_ellipse(shape: "CircleShape",
+                                 cx, cy, rx, ry, angle):
+    """圆在非等比变换后原地转成椭圆（保持对象身份，选择状态不丢）。"""
+    shape.__class__ = EllipseShape
+    shape.__dict__.pop("r", None)
+    shape.center = _round_point((cx, cy))
+    shape.rx = max(1, int(round(rx)))
+    shape.ry = max(1, int(round(ry)))
+    shape.angle = tf.normalize_angle(angle)
+
+
+def transform_shape(shape: "Shape", m: tf.Mat3):
+    """对图元做任意仿射变换（就地修改，含擦除掩码）。
+
+    直线/多边形：直接变换顶点，保证参数化存储；
+    圆/椭圆：用协方差矩阵特征分解精确换算半轴与旋转角，
+              圆在非等比缩放下自动变成椭圆；
+    光栅填充：映射像素清单与种子（允许负坐标，不做 0 钳制）。
+    """
+    _map_erased(shape, m)
     if isinstance(shape, LineShape):
-        shape.p0 = (shape.p0[0] + dx, shape.p0[1] + dy)
-        shape.p1 = (shape.p1[0] + dx, shape.p1[1] + dy)
+        shape.p0 = _round_point(tf.apply(m, shape.p0))
+        shape.p1 = _round_point(tf.apply(m, shape.p1))
     elif isinstance(shape, CircleShape):
-        shape.center = (shape.center[0] + dx, shape.center[1] + dy)
+        cx, cy, rx, ry, ang = tf.ellipse_from_matrix(
+            shape.center[0], shape.center[1], shape.r, shape.r, 0.0, m)
+        if abs(rx - ry) <= 0.75:                 # 仍接近正圆 → 保持圆
+            shape.center = _round_point((cx, cy))
+            shape.r = max(1, int(round((rx + ry) / 2.0)))
+        else:                                     # 非等比 → 精确转椭圆
+            _replace_circle_with_ellipse(shape, cx, cy, rx, ry, ang)
     elif isinstance(shape, EllipseShape):
-        shape.center = (shape.center[0] + dx, shape.center[1] + dy)
+        cx, cy, rx, ry, ang = tf.ellipse_from_matrix(
+            shape.center[0], shape.center[1], shape.rx, shape.ry,
+            getattr(shape, "angle", 0.0), m)
+        shape.center = _round_point((cx, cy))
+        shape.rx = max(1, int(round(rx)))
+        shape.ry = max(1, int(round(ry)))
+        shape.angle = tf.normalize_angle(ang)
     elif isinstance(shape, PolygonShape):
-        shape.vertices = [(x + dx, y + dy) for x, y in shape.vertices]
+        shape.vertices = [_round_point(tf.apply(m, v))
+                          for v in shape.vertices]
     elif isinstance(shape, RasterFillShape):
-        shape.seed = (shape.seed[0] + dx, shape.seed[1] + dy)
-        shape.pixels = [(x + dx, y + dy) for x, y in shape.pixels]
+        shape.seed = _round_point(tf.apply(m, shape.seed))
+        shape.pixels = [_round_point(tf.apply(m, p)) for p in shape.pixels]
+
+
+def translate(shape: "Shape", dx: int, dy: int):
+    """把图元几何参数整体平移（就地修改，擦除掩码同步移动）。"""
+    transform_shape(shape, tf.translation(dx, dy))
 
 
 def snapshot(shape: "Shape") -> dict:
-    """抓取几何参数快照（深拷贝，供命令 undo/redo 精确还原）。"""
+    """抓取几何参数快照（深拷贝，供命令 undo/redo 精确还原）。
+
+    额外记录 __cls__ 与 erased：圆↔椭圆转换、擦除掩码变换后
+    撤销/取消都能恢复到变换前的类型与掩码。
+    """
+    snap = {"__cls__": type(shape), "erased": set(shape.erased)}
     if isinstance(shape, LineShape):
-        return {"p0": shape.p0, "p1": shape.p1}
-    if isinstance(shape, CircleShape):
-        return {"center": shape.center, "r": shape.r}
-    if isinstance(shape, EllipseShape):
-        return {"center": shape.center, "rx": shape.rx, "ry": shape.ry}
-    if isinstance(shape, PolygonShape):
-        return {"vertices": list(shape.vertices)}
-    if isinstance(shape, RasterFillShape):
-        return {"seed": shape.seed, "pixels": list(shape.pixels)}
-    return {}
+        snap.update(p0=shape.p0, p1=shape.p1)
+    elif isinstance(shape, CircleShape):
+        snap.update(center=shape.center, r=shape.r)
+    elif isinstance(shape, EllipseShape):
+        snap.update(center=shape.center, rx=shape.rx, ry=shape.ry,
+                    angle=getattr(shape, "angle", 0.0))
+    elif isinstance(shape, PolygonShape):
+        snap.update(vertices=list(shape.vertices))
+    elif isinstance(shape, RasterFillShape):
+        snap.update(seed=shape.seed, pixels=list(shape.pixels))
+    return snap
 
 
 def restore(shape: "Shape", snap: dict):
-    """按快照还原几何参数。"""
+    """按快照还原几何参数（必要时恢复图元类型）。"""
+    cls = snap.get("__cls__")
+    if cls is not None and shape.__class__ is not cls:
+        shape.__class__ = cls
+        # 清理另一类型才有的字段，避免残留属性干扰后续保存/判定
+        if cls is CircleShape:
+            for k in ("rx", "ry", "angle"):
+                shape.__dict__.pop(k, None)
+        elif cls is EllipseShape:
+            shape.__dict__.pop("r", None)
     for k, v in snap.items():
+        if k == "__cls__":
+            continue
         setattr(shape, k, v)
+
+
+def _anchor_of(snap: dict, anchor: tuple = None):
+    """取缩放定点：显式 anchor 优先，否则圆心/中点/质心。"""
+    if anchor is not None:
+        return float(anchor[0]), float(anchor[1])
+    if "center" in snap:
+        return float(snap["center"][0]), float(snap["center"][1])
+    if "p0" in snap:
+        return ((snap["p0"][0] + snap["p1"][0]) / 2.0,
+                (snap["p0"][1] + snap["p1"][1]) / 2.0)
+    if "vertices" in snap and snap["vertices"]:
+        vs = snap["vertices"]
+        return (sum(v[0] for v in vs) / len(vs),
+                sum(v[1] for v in vs) / len(vs))
+    if "pixels" in snap and snap["pixels"]:
+        px = snap["pixels"]
+        return (sum(p[0] for p in px) / len(px),
+                sum(p[1] for p in px) / len(px))
+    return 0.0, 0.0
 
 
 def scale_snapshot(kind: str, snap: dict, fx: float,
@@ -87,48 +176,57 @@ def scale_snapshot(kind: str, snap: dict, fx: float,
     """按系数缩放一份几何快照（返回新快照，不改原图元）。
 
     fx/fy   X/Y 轴缩放系数（fy 缺省 = 等比）；
-    anchor  定点（缩放围绕的点），缺省 = 形状自身的圆心/中点/质心：
-            圆/椭圆以圆心为定点（半径/半轴 ×系数）；
-            直线以中点、多边形以质心为定点。
+    anchor  定点（缩放围绕的点），缺省 = 形状自身的圆心/中点/质心。
     系数钳制在 0.05~20，防止缩没或爆掉。
+
+    与旧实现相比：
+      - 圆在 fx≠fy 时按真实仿射变换转成椭圆，而不是只乘 fx；
+      - 椭圆支持旋转角，旋转后的非等比缩放也能正确换算；
+      - 光栅填充不再把负坐标钳到 0；
+      - 擦除掩码随几何一起缩放。
     """
-    fx = max(0.05, min(20.0, fx))
-    fy = fx if fy is None else max(0.05, min(20.0, fy))
-    out = {k: (tuple(v) if isinstance(v, tuple) else
-               [tuple(p) for p in v] if isinstance(v, list) else v)
-           for k, v in snap.items()}
-    if "r" in out:                                   # 圆：圆心定点，等比
-        out["r"] = max(1, int(round(out["r"] * fx)))
-    elif "rx" in out:                                # 椭圆：圆心定点
-        out["rx"] = max(1, int(round(out["rx"] * fx)))
-        out["ry"] = max(1, int(round(out["ry"] * fy)))
+    fx = max(0.05, min(20.0, float(fx)))
+    fy = fx if fy is None else max(0.05, min(20.0, float(fy)))
+    ax, ay = _anchor_of(snap, anchor)
+    m = tf.around((ax, ay), tf.scaling(fx, fy))
+    out = dict(snap)
+
+    if "erased" in out:
+        out["erased"] = {_round_point(tf.apply(m, p))
+                         for p in out["erased"]}
+
+    if "r" in out:                                   # 圆
+        cx, cy, nrx, nry, ang = tf.ellipse_from_matrix(
+            out["center"][0], out["center"][1], out["r"], out["r"], 0.0, m)
+        out["center"] = _round_point((cx, cy))
+        if abs(nrx - nry) <= 0.75:                   # 仍接近正圆
+            out["r"] = max(1, int(round((nrx + nry) / 2.0)))
+            out["__cls__"] = CircleShape
+        else:                                         # 非等比 → 椭圆
+            out.pop("r", None)
+            out.update(rx=max(1, int(round(nrx))),
+                       ry=max(1, int(round(nry))),
+                       angle=tf.normalize_angle(ang),
+                       __cls__=EllipseShape)
+    elif "rx" in out:                                # 椭圆（含旋转角）
+        cx, cy, nrx, nry, ang = tf.ellipse_from_matrix(
+            out["center"][0], out["center"][1], out["rx"], out["ry"],
+            out.get("angle", 0.0), m)
+        out["center"] = _round_point((cx, cy))
+        out["rx"] = max(1, int(round(nrx)))
+        out["ry"] = max(1, int(round(nry)))
+        out["angle"] = tf.normalize_angle(ang)
+        out["__cls__"] = EllipseShape
     elif "p0" in out:                                # 直线
-        ax, ay = (anchor if anchor else
-                  ((out["p0"][0] + out["p1"][0]) / 2,
-                   (out["p0"][1] + out["p1"][1]) / 2))
-        for k in ("p0", "p1"):
-            out[k] = (int(round(ax + (out[k][0] - ax) * fx)),
-                      int(round(ay + (out[k][1] - ay) * fy)))
+        out["p0"] = _round_point(tf.apply(m, out["p0"]))
+        out["p1"] = _round_point(tf.apply(m, out["p1"]))
     elif "vertices" in out:                          # 多边形
-        vs = out["vertices"]
-        ax = sum(v[0] for v in vs) / len(vs)
-        ay = sum(v[1] for v in vs) / len(vs)
-        ax, ay = (anchor if anchor else (ax, ay))
-        out["vertices"] = [(int(round(ax + (x - ax) * fx)),
-                            int(round(ay + (y - ay) * fy))) for x, y in vs]
-    elif "pixels" in out:                            # 光栅填充（像素集合）
-        px = out["pixels"]
-        if anchor:
-            ax, ay = anchor
-        else:
-            ax = sum(p[0] for p in px) / len(px)
-            ay = sum(p[1] for p in px) / len(px)
-        out["pixels"] = [(max(0, int(round(ax + (x - ax) * fx))),
-                          max(0, int(round(ay + (y - ay) * fy))))
-                         for x, y in px]
-        sx, sy = out["seed"]
-        out["seed"] = (max(0, int(round(ax + (sx - ax) * fx))),
-                       max(0, int(round(ay + (sy - ay) * fy))))
+        out["vertices"] = [_round_point(tf.apply(m, v))
+                           for v in out["vertices"]]
+    elif "pixels" in out:                            # 光栅填充
+        out["pixels"] = [_round_point(tf.apply(m, p))
+                         for p in out["pixels"]]
+        out["seed"] = _round_point(tf.apply(m, out["seed"]))
     return out
 
 
@@ -160,10 +258,11 @@ class CircleShape(Shape):
 
 @dataclass
 class EllipseShape(Shape):
-    """椭圆。center=(cx,cy)，rx/ry 分别为 x/y 方向半轴。"""
+    """椭圆。center=(cx,cy)，rx/ry 为半轴，angle 为主轴旋转角（度）。"""
     center: Tuple[int, int] = (0, 0)
     rx: int = 0
     ry: int = 0
+    angle: float = 0.0      # 屏幕坐标下正角 = 视觉顺时针
 
 
 @dataclass
@@ -172,6 +271,8 @@ class RasterFillShape(Shape):
     seed: Tuple[int, int] = (0, 0)
     pixels: List[Tuple[int, int]] = field(default_factory=list)
     owner: "Shape" = None    # 归属的边界图元：移动/缩放/删除整体联动
+    conn: Optional[int] = None   # 种子填充连通性（4/8），扫描线填充为 4
+    algo: Optional[str] = None   # 生成算法：seed4 / seed8 / scanline
 
 
 @dataclass

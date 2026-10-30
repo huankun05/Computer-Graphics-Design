@@ -183,6 +183,36 @@ class ErasePixelsCommand(Command):
         self._shape.erased = set(self._before)
 
 
+class ClipShapesCommand(Command):
+    """区域裁剪：移除窗口外图元 + 替换窗口内图元几何（整体一步撤销）。
+
+    与 "先 RemoveShapes 再 GroupMove" 相比，这里把删除与几何替换合成
+    同一条命令，Ctrl+Z 一次即可完整回到裁剪前（含原图元顺序）。
+    """
+    name = "裁剪图元"
+
+    def __init__(self, document, removed, entries):
+        self._doc = document
+        self._removed = list(removed)
+        self._indices = [document.shapes.index(s) for s in self._removed]
+        self._entries = [(s, dict(b), dict(a)) for s, b, a in entries]
+
+    def do(self):
+        from core.shapes import restore
+        for s in self._removed:
+            self._doc.shapes.remove(s)
+        for s, _b, a in self._entries:
+            restore(s, a)
+
+    def undo(self):
+        from core.shapes import restore
+        for s, i in sorted(zip(self._removed, self._indices),
+                           key=lambda t: t[1]):
+            self._doc.shapes.insert(i, s)
+        for s, b, _a in self._entries:
+            restore(s, b)
+
+
 class ClearCommand(Command):
     """清空文档（保留快照，撤销时整体恢复）。"""
     name = "清空画布"

@@ -64,9 +64,17 @@ def _shape_to_dict(idx: int, s: Shape, all_shapes: List[Shape]) -> dict:
     elif isinstance(s, EllipseShape):
         d["center"] = list(s.center)
         d["rx"], d["ry"] = s.rx, s.ry
+        d["angle"] = round(float(getattr(s, "angle", 0.0)), 4)
     elif isinstance(s, PolygonShape):
         d["vertices"] = [list(v) for v in s.vertices]
         d["fill"] = s.fill
+    elif isinstance(s, RasterFillShape):
+        d["seed"] = list(s.seed)
+        d["pixels"] = [list(p) for p in s.pixels]
+        if s.conn is not None:
+            d["conn"] = int(s.conn)
+        if s.algo is not None:
+            d["algo"] = s.algo
     return d
 
 
@@ -88,6 +96,7 @@ def _dict_to_shape(d: dict) -> Shape:
         s = EllipseShape(kind=kind, color=color, width=width)
         s.center = tuple(d["center"])
         s.rx, s.ry = int(d["rx"]), int(d["ry"])
+        s.angle = float(d.get("angle", 0.0))    # 旧工程缺省 0°
     elif kind == KIND_POLYGON:
         s = PolygonShape(kind=kind, color=color, width=width)
         s.vertices = [tuple(v) for v in d["vertices"]]
@@ -96,6 +105,8 @@ def _dict_to_shape(d: dict) -> Shape:
         s = RasterFillShape(kind=kind, color=color, width=width)
         s.seed = tuple(d.get("seed", (0, 0)))
         s.pixels = [tuple(p) for p in d.get("pixels", [])]
+        s.conn = d.get("conn")
+        s.algo = d.get("algo")
     else:
         raise ValueError(f"未知图元类型: {kind}")
     s.visible = visible
@@ -114,7 +125,7 @@ def save_project(path: str, shapes: List[Shape]) -> bool:
     lst = list(shapes)
     data = {
         "app": "图形画板",
-        "version": 1,
+        "version": 2,       # v2：椭圆 angle / 填充 conn+algo / 光栅填充像素
         "shapes": [_shape_to_dict(i, s, lst) for i, s in enumerate(lst)],
     }
     with open(path, "w", encoding="utf-8") as f:

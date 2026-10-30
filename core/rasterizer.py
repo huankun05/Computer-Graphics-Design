@@ -20,6 +20,7 @@ from algorithms.line_dda import dda_line
 from algorithms.line_bresenham import bresenham_line
 from algorithms.circle_midpoint import midpoint_circle
 from algorithms.ellipse_midpoint import midpoint_ellipse
+from algorithms.ellipse_rotated import rotated_ellipse
 from algorithms.fill_scanline import scanline_fill
 from algorithms.fill_span import span_fill
 from algorithms.circle_dda import dda_circle
@@ -71,8 +72,16 @@ def rasterize(shape: Shape) -> Tuple[List[Pixel], List[Pixel]]:
 
     if isinstance(shape, EllipseShape):
         cx, cy = shape.center
-        outline = midpoint_ellipse(cx, cy, shape.rx, shape.ry)
-        fill = span_fill(outline) if shape.fill else []
+        angle = getattr(shape, "angle", 0.0)
+        if abs(angle) > 1e-6:
+            # 旋转椭圆：扫描线求交，轮廓/填充一次生成
+            outline, inside = rotated_ellipse(cx, cy, shape.rx, shape.ry,
+                                              angle)
+            fill = inside if shape.fill else []
+        else:
+            # 角度为 0 时保持原中点椭圆路径，既有像素回归不变
+            outline = midpoint_ellipse(cx, cy, shape.rx, shape.ry)
+            fill = span_fill(outline) if shape.fill else []
         outline, fill = _apply_erased(shape, outline, fill)
         return outline, fill
 

@@ -320,6 +320,11 @@ class PolygonTool(ToolBase):
         super().__init__(canvas)
         self._verts = []            # 已点下的顶点
 
+    @property
+    def is_drawing(self) -> bool:
+        """多边形容器正在布点：Backspace 应回退顶点而不是删图元。"""
+        return bool(self._verts)
+
     def on_press(self, pos, event=None):
         self._verts.append((int(pos.x()), int(pos.y())))
         self._update_preview()
@@ -393,42 +398,8 @@ class PolygonTool(ToolBase):
 
 
 # =====================================================================
-# 选择 / 移动工具：点选图元、拖拽移动、方向键微调（全部可撤销）
+# 选择 / 变换统一走模块三 Transform2DTool（原"选择 / 移动"已合并，避免重复）
 # =====================================================================
-class SelectMoveTool(ToolBase):
-    name = "选择 / 移动"
-    icon_name = "cursor"
-    cursor_hint = "点击选中图元；再按住拖动移动；方向键微调 1 格"
-    algorithm_options = []
-
-    def __init__(self, canvas):
-        super().__init__(canvas)
-        self._prev = None           # 上一次选中的图元（二次按下即拖动）
-
-    def on_press(self, pos, event=None):
-        prev = self.canvas._selected_shape
-        hit = self.canvas.hit_test(pos)
-        self.canvas.set_selected_shape(hit)
-        # 点在"已选中"的图元上再按 → 进入画布移动上下文（拖拽/幽灵预览）
-        if hit is not None and hit is prev:
-            self.canvas.begin_move(pos)
-            self._prev = hit
-        else:
-            self._prev = hit
-
-    def on_move(self, pos, event=None):
-        if self.canvas._move_ctx:
-            self.canvas.update_move(pos)
-
-    def on_release(self, pos, event=None):
-        if self.canvas._move_ctx:
-            self.canvas.end_move()
-        self._prev = None
-
-    def cancel(self):
-        self.canvas.cancel_move()
-
-
 PolygonFillTool = PolygonTool
 
 
@@ -577,31 +548,12 @@ class FillTool(ToolBase):
         用解析几何判定（点在圆/椭圆/多边形内），而不是查轮廓像素——
         种子通常在区域中心，轮廓环上没有这个点。
         """
-        from core.shapes import (CircleShape, EllipseShape, PolygonShape,
-                                 RasterFillShape)
-        x, y = seed
+        from core.geom import shape_contains
+        from core.shapes import RasterFillShape
         for cand in reversed(self.canvas.document.shapes):
             if not cand.visible or isinstance(cand, RasterFillShape):
                 continue
-            if isinstance(cand, CircleShape):
-                cx, cy = cand.center
-                inside = (x - cx) ** 2 + (y - cy) ** 2 <= cand.r ** 2
-            elif isinstance(cand, EllipseShape):
-                cx, cy = cand.center
-                inside = ((x - cx) / max(1, cand.rx)) ** 2 + \
-                         ((y - cy) / max(1, cand.ry)) ** 2 <= 1
-            elif isinstance(cand, PolygonShape) and len(cand.vertices) >= 3:
-                vs = cand.vertices
-                inside = False                      # 射线法（+x 方向）
-                for i in range(len(vs)):
-                    (x0, y0), (x1, y1) = vs[i], vs[(i + 1) % len(vs)]
-                    if (y0 > y) != (y1 > y):
-                        xi = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
-                        if xi > x:
-                            inside = not inside
-            else:
-                continue
-            if inside:
+            if shape_contains(cand, seed):
                 return cand
         return None
 

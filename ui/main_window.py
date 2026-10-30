@@ -101,11 +101,10 @@ class MainWindow(QMainWindow):
             ("Ctrl+Delete", lambda: self.canvas.clear_all()),
         ]:
             QShortcut(QKeySequence(seq), self, activated=slot)
-        QShortcut(QKeySequence("Tab"), self, activated=self._toggle_panels)
         QShortcut(QKeySequence("F1"), self, activated=self._show_help)
         QShortcut(QKeySequence("?"), self, activated=self._show_help)
-        # 单键（1~8/V/E/K/Delete/+/-/空格/方向键）统一走事件过滤器路由
-        # （输入框内打字不拦截），见 eventFilter
+        # 单键（1~9/V/E/K/Delete/Backspace/Tab/+/-/空格/方向键）统一走事件过滤器
+        # 路由（输入框内打字不拦截；Ctrl/Alt/Win 组合让给 QShortcut），见 eventFilter
         self.installEventFilter(self)
 
         # 默认选第一个工具并刷新一次按钮态
@@ -238,6 +237,14 @@ class MainWindow(QMainWindow):
         center = QVBoxLayout()
         center.setSpacing(8)
         center.addWidget(self._build_options_bar())
+        # 工具专属面板（变换数值面板 / 裁剪窗口参数）：无面板时整行隐藏
+        self.tool_panel_host = QFrame()
+        self.tool_panel_host.setObjectName("toolPanel")
+        self._tool_panel_lay = QHBoxLayout(self.tool_panel_host)
+        self._tool_panel_lay.setContentsMargins(12, 4, 12, 4)
+        self._tool_panel_lay.setSpacing(8)
+        self.tool_panel_host.setVisible(False)
+        center.addWidget(self.tool_panel_host)
         center.addWidget(self._app_canvas, stretch=1)
         self._app_center = center          # 模式切换时把画布移回这里
         body.addLayout(center, stretch=1)
@@ -579,7 +586,23 @@ class MainWindow(QMainWindow):
             self.canvas.set_algorithm(self._algo_keys[self.algo_combo.currentIndex()])
         self.algo_combo.blockSignals(False)
 
+        # 工具专属面板：工具自己声明（框架不写死任何具体模块）
+        self._mount_tool_panel(tool)
 
+    def _mount_tool_panel(self, tool):
+        """清空并挂载工具的专属面板；工具无面板则整行隐藏。"""
+        while self._tool_panel_lay.count():
+            it = self._tool_panel_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        w = tool.panel_widget() if hasattr(tool, "panel_widget") else None
+        if w is None:
+            self.tool_panel_host.setVisible(False)
+            return
+        self._tool_panel_lay.addWidget(w)
+        self.tool_panel_host.setVisible(True)
 
     # ==================================================================
     # 颜色 / 线宽
@@ -710,8 +733,8 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
         """全局单键路由（焦点无关；输入框内打字不拦截）：
 
-        空格=平移（按住）/ K=演示播放暂停 / 1~8=切工具 / V=选择 / E=橡皮擦 /
-        Delete=删除选中 / +-=缩放步进 / ←→↑↓=演示单步或图元微调。
+        空格=平移（按住）/ K=演示播放暂停 / 1~9=切工具 / V=二维变换 / E=橡皮擦 /
+        Delete 或 Backspace=删除选中 / +-=缩放步进 / ←→↑↓=演示单步或图元微调。
         Ctrl 组合键由 QShortcut 处理。
         另：_drag_widgets 里的容器（状态栏）空白处左键按下 = 拖动窗口。
         """
@@ -728,6 +751,17 @@ class MainWindow(QMainWindow):
         if self._is_input_widget(obj):
             return super().eventFilter(obj, event)   # 输入框内：按键属于文本
         key = event.key()
+        mods = event.modifiers()
+        # Ctrl/Alt/Win 组合一律交给 QShortcut（避免 Ctrl+Delete 清空工程时
+        # 又被单键分支当成"删除选中"，也避免 Ctrl+1 同时切换工具）
+        if mods & (Qt2.ControlModifier | Qt2.AltModifier | Qt2.MetaModifier):
+            return super().eventFilter(obj, event)
+
+        # ---- Tab：收起/展开两侧面板（输入框内保持焦点切换） ----
+        if key == Qt2.Key_Tab and event.type() == QEvent.KeyPress \
+                and mods == Qt2.NoModifier:
+            self._toggle_panels()
+            return True
 
         # ---- 空格：任何模式下按住 = 平移 ----
         if key == Qt2.Key_Space and not event.isAutoRepeat():
@@ -761,9 +795,12 @@ class MainWindow(QMainWindow):
         if key == Qt2.Key_E:
             self._activate_eraser_tool()
             return True
-        if key == Qt2.Key_Delete:
-            self._delete_selected()
-            return True
+        if key in (Qt2.Key_Delete, Qt2.Key_Backspace):
+            # 绘制多边形布点过程中，Backspace 归工具退点，不删图元
+            if not (self._current_tool
+                    and getattr(self._current_tool, "is_drawing", False)):
+                self._delete_selected()
+                return True
         if key == Qt2.Key_K and self.body_stack.currentIndex() == 1:
             self.demo_view.play_pause()
             return True
@@ -793,9 +830,9 @@ class MainWindow(QMainWindow):
         return False
 
     def _activate_select_tool(self):
-        """V：切到选择/移动工具。"""
+        """V：切到二维变换工具（选择/移动已合并到该工具）。"""
         for i, cls in enumerate(self._tool_classes):
-            if cls.__name__ == "SelectMoveTool":
+            if cls.__name__ == "Transform2DTool":
                 self._activate_tool(i)
                 return
 
@@ -808,18 +845,21 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(dlg)
         groups = [
             ("通用", [
-                ("1 ~ 8", "切换工具（直线/圆/椭圆/多边形/直线对比/选择/填充多边形/橡皮擦）"),
-                ("V", "选择 / 移动工具"),
+                ("1 ~ 9", "切换工具（直线/圆/椭圆/多边形/直线对比/橡皮擦/"
+                           "填充/二维变换/区域裁剪）"),
+                ("V", "二维变换（选择 / 移动 / 旋转 / 缩放）"),
                 ("E", "橡皮擦"),
                 ("Ctrl+Delete", "清空画布"),
                 ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
                 ("Ctrl+0 / Ctrl+1", "适配窗口 / 100%"),
                 ("Ctrl+S / Ctrl+Shift+S / Ctrl+O", "导出 PNG / 保存工程 / 打开工程"),
-                ("Delete", "删除选中的图元"),
+                ("Delete / Backspace", "删除选中的图元（整组一步撤销）"),
+                ("变换面板内回车", "直接应用当前数值（移动/旋转/缩放）"),
                 ("Tab", "收起/展开两侧面板（应用模式）"),
                 ("Esc", "取消进行中的绘制 / 移动"),
                 ("方向键", "微调选中的图元（任意工具下）"),
-                ("Shift + 拖拽", "约束：直线 45° 吸附 / 椭圆变正圆"),
+                ("Shift + 拖拽", "约束：直线 45° 吸附 / 椭圆变正圆 / 缩放手柄等比"),
+                ("拖拽包围盒上方环形箭头", "以包围盒中心旋转（面板实时显示角度）"),
                 ("滚轮", "以指针为中心缩放"),
                 ("空格 + 拖拽 / 中键拖拽", "平移画布（应用/演示模式）"),
                 ("画布右键", "上下文菜单"),
@@ -908,10 +948,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导出失败", "文件写入失败，请检查路径。")
 
     def _delete_selected(self):
-        sel = self.canvas._selected_shape
-        if sel is not None:
-            self.canvas.set_selected_shape(None)
-            self.canvas.remove_shape(sel)
+        """删除选中的图元（整组一步撤销；与画布 Backspace 行为一致）。"""
+        self.canvas.delete_selection()
 
     # ==================================================================
     # 画布右键菜单

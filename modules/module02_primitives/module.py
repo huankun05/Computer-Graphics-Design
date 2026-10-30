@@ -11,7 +11,7 @@
 from core.registry import ModuleSpec, register
 from modules.module02_primitives.tools import (
     LineTool, CircleTool, EllipseTool, PolygonTool, CompareLineTool,
-    SelectMoveTool, EraserTool, FillTool,
+    EraserTool, FillTool,
 )
 from modules.module02_primitives.demos import create_demos
 
@@ -27,7 +27,6 @@ MODULE = ModuleSpec(
         EllipseTool,           # 椭圆（中点椭圆，支持填充）
         PolygonTool,           # 多边形描边（是否填充跟随选项条开关）
         CompareLineTool,       # 一拖同画 DDA+Bresenham 同位双层对比
-        SelectMoveTool,        # 选择/移动（点选、拖拽、方向键微调）
         EraserTool,            # 橡皮擦（像素擦除 / 整体删除）
         FillTool,              # 填充（油漆桶：点边界内部，四/八联通可选）
     ],

@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple  # noqa: F401
 from PySide6.QtCore import Qt, Signal, QPointF, QPoint, QRect, QRectF, QTimer
 from PySide6.QtGui import QCursor
 from PySide6.QtGui import (
-    QImage, QPainter, QPen, QColor, QPixmap, QBrush,
+    QImage, QPainter, QPen, QColor, QPixmap, QBrush, QFont, QFontMetricsF,
     QMouseEvent, QWheelEvent
 )
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
@@ -72,9 +72,11 @@ def _preview_signature(shape: Optional[Shape]):
     if isinstance(shape, LineShape):
         return ("line", shape.kind, shape.p0, shape.p1, shape.width)
     if isinstance(shape, CircleShape):
-        return ("circle", shape.center, shape.r, shape.width)
+        return ("circle", shape.center, shape.r, shape.width, shape.fill)
     if isinstance(shape, EllipseShape):
-        return ("ellipse", shape.center, shape.rx, shape.ry, shape.width)
+        return ("ellipse", shape.center, shape.rx, shape.ry,
+                round(float(getattr(shape, "angle", 0.0)), 3),
+                shape.width, shape.fill)
     if isinstance(shape, PolygonShape):
         return ("poly", tuple(shape.vertices), shape.fill, shape.width)
     return (shape.kind, shape.width)
@@ -91,6 +93,7 @@ class CanvasView(QGraphicsView):
     shapes_committed    = Signal(object)     # 新图元提交（演示模式回放用）
     selection_changed   = Signal(object)     # 选中图元变化（图元列表/选项条联动）
     fill_toggled        = Signal(object)     # 填充切换（演示模式追加填充动画）
+    transform_dragged   = Signal(str, float, float)  # 拖拽变换结束（模式, 角度/比例x, 比例y）
     notify              = Signal(str)        # 轻量提示（状态栏临时消息）
     demo_arrow          = Signal(int)        # 演示模式左右方向键（±1 单步）
 
@@ -137,6 +140,11 @@ class CanvasView(QGraphicsView):
         self.show_grid = True
         self.show_axis = True
         self._selected_shape: Optional[Shape] = None
+        self._selection: List[Shape] = []    # 多选（模块三 Shift 多选 / 框选）
+        self.tool_overlay = None              # 工具自绘叠层（裁剪窗口等）
+        self._menu_suppressed = False         # 右键已被工具消费 → 跳过上下文菜单
+        self._rubber = None                   # 框选矩形（模拟像素坐标）
+        self._rubber_additive = False
         self._ghost_pixels = []              # 幽灵像素（移动预览）
         self._ghost_color = SELECT_COLOR
         self._move_ctx = None                # 移动上下文 {shape,start,snap,last}
@@ -219,7 +227,10 @@ class CanvasView(QGraphicsView):
         if self.tool:
             self.tool.deactivate()
         self.tool = tool
+        self.tool_overlay = getattr(tool, "draw_overlay", None)
+        self.cancel_rubber()
         self.set_preview(None)
+        self.viewport().update()
 
     def set_pen_color(self, c):
         self.pen_color = c
@@ -246,10 +257,19 @@ class CanvasView(QGraphicsView):
         return (x0, y0, x1, y1)
 
     def hit_test(self, pos) -> Optional[Shape]:
-        """模拟像素坐标 → 命中的最上层图元（轮廓或内部像素），无则 None。"""
+        """模拟像素坐标 → 命中的最上层图元（轮廓或内部像素），无则 None。
+
+        性能：先用解析包围盒预筛（O(1) 判定），只对候选图元光栅化；
+        图元较多时不再逐图元跑 Bresenham/中点算法。
+        """
+        from core.geom import bbox_of
         x, y = int(pos.x()), int(pos.y())
         for shape in reversed(self.document.shapes):    # 后画的在上层
             if not shape.visible:
+                continue
+            bb = bbox_of(shape)
+            if bb is not None and not (bb[0] <= x <= bb[2]
+                                       and bb[1] <= y <= bb[3]):
                 continue
             outline, fill = rasterize(shape)
             if (x, y) in set(outline) or (x, y) in set(fill):
@@ -283,15 +303,27 @@ class CanvasView(QGraphicsView):
                 (x0, y1, "xy"), (x0, cy, "x")]
 
     def _sel_bbox(self) -> tuple:
-        """选中图元的真实像素包围盒，无选中/空图元返回 None。"""
-        s = self._selected_shape
-        if s is None:
+        """所选图元（可多选）的真实像素包围盒，无选中/空图元返回 None。"""
+        boxes = [self._shape_bbox(s) for s in self._selection]
+        boxes = [b for b in boxes if b]
+        if not boxes:
             return None
-        bbox = self._shape_bbox(s)
-        return bbox
+        return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    _ROTATE_OFFSET = 30       # 旋转手柄在包围盒上方的距离（场景像素）
+
+    def _rotate_handle(self, bbox):
+        """旋转手柄位置（包围盒顶边中点正上方）。"""
+        if not bbox:
+            return None
+        cx = (bbox[0] + bbox[2]) / 2
+        return (cx, bbox[1] - self._ROTATE_OFFSET)
 
     def _handle_hit(self, pos):
         """场景真实像素坐标 → 命中的手柄 (x, y, 轴模式)，未命中返回 None。
+
+        选中任何图元都可用旋转手柄（主流画板一致），不依赖具体工具。
 
         注意：手柄位于包围盒边缘（任意真实像素值），必须用未量化的
         场景点做命中——若先按模拟格取整会偏差最多 SIM-1 像素，
@@ -301,8 +333,13 @@ class CanvasView(QGraphicsView):
         if bbox is None:
             return None
         px, py = pos.x(), pos.y()
+        rh = self._rotate_handle(bbox)
+        if rh and abs(px - rh[0]) <= self._HANDLE_TOL + 4 and \
+                abs(py - rh[1]) <= self._HANDLE_TOL + 4:
+            return (rh[0], rh[1], "rotate")
         for hx, hy, axis in self._handle_positions(bbox):
-            if abs(px - hx) <= self._HANDLE_TOL and                     abs(py - hy) <= self._HANDLE_TOL:
+            if abs(px - hx) <= self._HANDLE_TOL and \
+                    abs(py - hy) <= self._HANDLE_TOL:
                 return (hx, hy, axis)
         return None
 
@@ -344,7 +381,7 @@ class CanvasView(QGraphicsView):
         if s is None:
             return False
         from core.shapes import snapshot
-        members = self._transform_group(s)
+        members = self._selection_members()
         ctx = {"shape": s,
                "group": [(m, snapshot(m)) for m in members],
                "start": (int(pos.x()), int(pos.y())),
@@ -386,14 +423,46 @@ class CanvasView(QGraphicsView):
             ay = (bbox[1] + bbox[3]) / 2
         if axis == "y":
             ax = (bbox[0] + bbox[2]) / 2
+        anchor_sim = (ax / SIM, ay / SIM)
+        # 圆/椭圆沿用既有交互：手柄缩放以圆心为定点，圆心不随缩放漂移
+        #（旧实现的圆缩放本来就是圆心定点，这里保持行为一致）。
+        # 多选时一律以包围盒定点缩放，否则各图元会各缩各的、整体散架。
+        if len(self._selection) == 1 and \
+                isinstance(s, (CircleShape, EllipseShape)):
+            ax, ay = s.center[0] * SIM, s.center[1] * SIM
+            anchor_sim = (s.center[0], s.center[1])
         self._move_ctx = {"shape": s,
                           "group": [(m, snapshot(m))
-                                    for m in self._transform_group(s)],
+                                    for m in self._selection_members()],
                           "mode": "scale_" + axis,
                           "anchor": (ax, ay), "snap": snapshot(s),
                           "h0": (float(hx), float(hy)),
-                          "anchor_sim": (ax / SIM, ay / SIM),
+                          "anchor_sim": anchor_sim,
                           "last": (1.0, 1.0)}
+        return True
+
+    def begin_rotate(self, pos) -> bool:
+        """开始旋转：一律以所选包围盒中心为定点（任何图元都先被矩形框住）。"""
+        import math
+        from core.shapes import snapshot
+        s = self._selected_shape
+        if s is None:
+            return False
+        bbox = self._sel_bbox()
+        if bbox is None:
+            return False
+        pivot = ((bbox[0] + bbox[2]) / 2.0 / SIM,
+                 (bbox[1] + bbox[3]) / 2.0 / SIM)
+        px, py = float(pos.x()), float(pos.y())
+        self._move_ctx = {"shape": s,
+                          "group": [(m, snapshot(m))
+                                    for m in self._selection_members()],
+                          "mode": "rotate",
+                          "pivot": (float(pivot[0]), float(pivot[1])),
+                          "a0": math.atan2(py - pivot[1], px - pivot[0]),
+                          "angle": 0.0,
+                          "snap": snapshot(s),
+                          "last": (0.0, 0.0)}
         return True
 
     def update_move(self, pos):
@@ -404,12 +473,28 @@ class CanvasView(QGraphicsView):
         像素再算比例（anchor/h0 存的是真实像素），避免两套单位混算。
         """
         import math
-        from core.shapes import restore, scale_snapshot, translate
+        from core.shapes import restore, scale_snapshot, translate, \
+            transform_shape
         if not self._move_ctx:
             return
         ctx = self._move_ctx
         grp = ctx.get("group") or [(ctx["shape"], ctx["snap"])]
-        if ctx["mode"] == "scale_uni":
+        if ctx["mode"] == "rotate":
+            from algorithms import transform2d as tf
+            from PySide6.QtWidgets import QApplication
+            px, py = float(pos.x()), float(pos.y())
+            piv = ctx["pivot"]
+            a1 = math.atan2(py - piv[1], px - piv[0])
+            delta = math.degrees(a1 - ctx["a0"])
+            if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+                delta = round(delta / 15.0) * 15.0      # Shift：15° 吸附
+            ctx["last"] = (delta, 0.0)
+            ctx["angle"] = delta
+            m = tf.around(piv, tf.rotation(delta))
+            for member, snap in grp:
+                restore(member, snap)
+                transform_shape(member, m)
+        elif ctx["mode"] == "scale_uni":
             # Ctrl+拖拽：定点 = 图元锚点（模拟像素），比例 = 距离比
             ax, ay = ctx["anchor"]
             d1 = max(1.0, math.hypot(pos.x() - ax, pos.y() - ay))
@@ -422,6 +507,7 @@ class CanvasView(QGraphicsView):
                                         anchor=(ax, ay))
                 restore(m, scaled)
         elif ctx["mode"].startswith("scale"):
+            from PySide6.QtWidgets import QApplication
             # 手柄缩放：定点/初始手柄/当前点统一用真实像素
             rx, ry = pos.x() * SIM, pos.y() * SIM
             ax, ay = ctx["anchor"]
@@ -436,6 +522,10 @@ class CanvasView(QGraphicsView):
                 fy = max(0.05, min(20.0, abs(ry - ay) / dy0))
             else:
                 fy = 1.0
+            # Shift = 刚性等比缩放（四边手柄也按比例），不按 = 自由比例
+            if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+                f = max(fx, fy)
+                fx = fy = f
             ctx["fx"], ctx["fy"] = fx, fy
             for m, snap in grp:
                 restore(m, snap)                 # 先还原到变换前
@@ -514,7 +604,11 @@ class CanvasView(QGraphicsView):
         grp = ctx.get("group") or [(ctx["shape"], ctx["snap"])]
         self.set_ghost([])
         self._move_ctx = None
-        if ctx["mode"] == "scale_uni" or ctx["mode"].startswith("scale"):
+        if ctx["mode"] == "rotate":
+            if abs(ctx.get("angle", 0.0)) < 1e-9:
+                return
+            name = "旋转图元"
+        elif ctx["mode"] == "scale_uni" or ctx["mode"].startswith("scale"):
             name = "缩放图元"
         else:
             dx, dy = ctx["last"]
@@ -535,12 +629,24 @@ class CanvasView(QGraphicsView):
         self.document.do(GroupMoveCommand(self.document, entries, name))
         self._render_base()
         self.document_changed.emit()
+        # 拖拽结束回填面板当前值（旋转角度 / 缩放比例）
+        if ctx["mode"] == "rotate":
+            self.transform_dragged.emit("rotate",
+                                        float(ctx.get("angle", 0.0)), 0.0)
+        elif ctx["mode"].startswith("scale"):
+            self.transform_dragged.emit("scale", float(ctx.get("fx", 1.0)),
+                                        float(ctx.get("fy", 1.0)))
 
     def cancel_move(self):
-        """Esc：放弃正在进行的变换（还原参数，清幽灵）。"""
+        """Esc：放弃正在进行的变换（整组还原参数，清幽灵）。"""
         if self._move_ctx:
             from core.shapes import restore
-            restore(self._move_ctx["shape"], self._move_ctx["snap"])
+            ctx = self._move_ctx
+            # 成组变换时边界与填充都要还原；旧实现只还原主图元，
+            # 会导致填充停在变换后的位置。
+            for m, snap in (ctx.get("group") or
+                            [(ctx["shape"], ctx["snap"])]):
+                restore(m, snap)
             self.set_ghost([])
             self._move_ctx = None
 
@@ -604,6 +710,8 @@ class CanvasView(QGraphicsView):
             self._plot(p, fill, s.color, s.inset)
         p.end()
         self.pix_item.setPixmap(QPixmap.fromImage(self.base_image))
+        # 增量绘制同样要整视口刷新，避免前景层的旧选中框/手柄残留
+        self.viewport().update()
 
     def remove_shape(self, shape: Shape):
         """删除图元（图元列表用），可撤销；边界/填充成组整体删除。"""
@@ -696,21 +804,175 @@ class CanvasView(QGraphicsView):
     # 图元列表选中（画布上画虚线包围盒 + 角点手柄）
     # ==================================================================
     def set_selected_shape(self, shape: Optional[Shape]):
-        self._selected_shape = shape
-        self.selection_changed.emit(shape)
+        """单选（图元列表/原有交互入口）：等价于只选中这一个图元。"""
+        self.set_selection([shape] if shape is not None else [])
+
+    def set_selection(self, shapes, primary: Optional[Shape] = None):
+        """设置多选集（模块三：Shift 多选 / 框选）。
+
+        primary 为"主图元"（图元列表与选项条联动用），缺省取最后一个。
+        """
+        self._selection = [s for s in shapes if s is not None]
+        if primary is not None and any(primary is s for s in self._selection):
+            self._selected_shape = primary
+        else:
+            self._selected_shape = (self._selection[-1]
+                                    if self._selection else None)
+        self.selection_changed.emit(self._selected_shape)
         self.viewport().update()
+
+    @property
+    def selection(self) -> List[Shape]:
+        """当前多选集（副本）。"""
+        return list(self._selection)
+
+    def toggle_selected(self, shape: Shape):
+        """Shift 点选：已选中则移出，未选中则加入。"""
+        if shape is None:
+            return
+        sel = list(self._selection)
+        if any(shape is s for s in sel):
+            sel = [s for s in sel if s is not shape]
+        else:
+            sel.append(shape)
+        self.set_selection(sel, primary=shape if any(shape is s for s in sel)
+                          else None)
+
+    def _selection_members(self) -> List[Shape]:
+        """多选集展开成"实际参与变换"的成员（边界 + 其填充，去重保序）。"""
+        out: List[Shape] = []
+        seen = set()
+        for s in self._selection:
+            for m in self._transform_group(s):
+                if id(m) in seen:
+                    continue
+                seen.add(id(m))
+                out.append(m)
+        return out
+
+    def delete_selection(self) -> bool:
+        """删除当前选中图元（Backspace / Delete 共用，整组一步撤销）。
+
+        边界连同依附的油漆桶填充一起删除，避免留下孤立填充。
+        """
+        members = self._selection_members()
+        if not members:
+            return False
+        from core.commands import RemoveShapesCommand
+        cmd = RemoveShapesCommand(self.document, members)
+        cmd.capture()
+        self.document.do(cmd)
+        self.set_selection([])
+        self._render_base()
+        self.shape_count_changed.emit(len(self.document.shapes))
+        self.document_changed.emit()
+        return True
+
+    # ------------------------------------------------------------------
+    # 框选（模块三）：空白处拖出矩形 → 选中相交图元
+    # ------------------------------------------------------------------
+    def begin_rubber(self, pos, additive: bool = False):
+        """开始框选：pos 为模拟像素坐标。"""
+        self._rubber = (int(pos.x()), int(pos.y()),
+                        int(pos.x()), int(pos.y()))
+        self._rubber_additive = additive
+        self.viewport().update()
+
+    def update_rubber(self, pos):
+        if self._rubber is None:
+            return
+        x0, y0, _x1, _y1 = self._rubber
+        self._rubber = (x0, y0, int(pos.x()), int(pos.y()))
+        self.viewport().update()
+
+    def cancel_rubber(self):
+        if self._rubber is not None:
+            self._rubber = None
+            self.viewport().update()
+
+    def end_rubber(self) -> int:
+        """结束框选：按矩形选中相交图元，返回选中数量。"""
+        from core.geom import bbox_of
+        if self._rubber is None:
+            return 0
+        x0, y0, x1, y1 = self._rubber
+        rx0, rx1 = min(x0, x1), max(x0, x1)
+        ry0, ry1 = min(y0, y1), max(y0, y1)
+        self._rubber = None
+        picked = []
+        if rx1 - rx0 >= 1 or ry1 - ry0 >= 1:      # 单击不当作框选
+            for s in self.document.shapes:
+                if not s.visible:
+                    continue
+                bb = bbox_of(s)
+                if bb is None:
+                    continue
+                if bb[0] <= rx1 and bb[2] >= rx0 and \
+                        bb[1] <= ry1 and bb[3] >= ry0:
+                    picked.append(s)
+        if self._rubber_additive:
+            merged = list(self._selection)
+            for s in picked:
+                if not any(s is m for m in merged):
+                    merged.append(s)
+            self.set_selection(merged)
+        else:
+            self.set_selection(picked)
+        return len(self._selection)
+
+    # ------------------------------------------------------------------
+    # 数值变换（模块三的变换面板）：任意 3×3 仿射矩阵作用于多选集
+    # ------------------------------------------------------------------
+    def transform_selection(self, m, name: str = "变换图元") -> bool:
+        """对当前多选集应用仿射矩阵（整组一步撤销）。"""
+        from core.commands import GroupMoveCommand
+        from core.shapes import RasterFillShape, snapshot, transform_shape
+        members = self._selection_members()
+        if not members:
+            return False
+        before = [(s, snapshot(s)) for s in members]
+        for s in members:
+            transform_shape(s, m)
+        for s, _b in before:                      # 光栅填充按新几何重跑
+            if isinstance(s, RasterFillShape):
+                self._refill(s)
+        entries = [(s, b, snapshot(s)) for s, b in before]
+        if all(b == a for _s, b, a in entries):
+            return False
+        self.document.do(GroupMoveCommand(self.document, entries, name))
+        self._render_base()
+        self.document_changed.emit()
+        return True
+
+    # ------------------------------------------------------------------
+    # 旋转 / 缩放定点：所选图元包围盒中心（模拟像素）
+    # ------------------------------------------------------------------
+    def pivot_point(self):
+        """当前变换定点（模拟像素）：所选包围盒中心，无选中返回 None。"""
+        bbox = self._sel_bbox()
+        if not bbox:
+            return None
+        return ((bbox[0] + bbox[2]) / 2.0 / SIM,
+                (bbox[1] + bbox[3]) / 2.0 / SIM)
 
     @staticmethod
     def _shape_bbox(shape: Shape):
-        """图元的包围盒（真实位图坐标，模拟像素 ×SIM），空图元返回 None。"""
-        outline, fill = rasterize(shape)
-        pts = outline + fill
-        if not pts:
-            return None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        return (min(xs) * SIM, min(ys) * SIM,
-                (max(xs) + 1) * SIM - 1, (max(ys) + 1) * SIM - 1)
+        """图元的包围盒（真实位图坐标，模拟像素 ×SIM），空图元返回 None。
+
+        使用 core.geom.bbox_of 的解析包围盒（不光栅化）：选中框绘制与
+        手柄命中都是高频路径，图元多时也不会卡顿。
+        """
+        from core.geom import bbox_of
+        bb = bbox_of(shape)
+        if bb is None:
+            outline, fill = rasterize(shape)     # 未知图元类型兜底
+            pts = outline + fill
+            if not pts:
+                return None
+            bb = (min(p[0] for p in pts), min(p[1] for p in pts),
+                  max(p[0] for p in pts), max(p[1] for p in pts))
+        return (bb[0] * SIM, bb[1] * SIM,
+                (bb[2] + 1) * SIM - 1, (bb[3] + 1) * SIM - 1)
 
     # ==================================================================
     # 预览（拖拽实时反馈）
@@ -790,6 +1052,9 @@ class CanvasView(QGraphicsView):
         self.pix_item.setPixmap(QPixmap.fromImage(img))
         self.pix_item.setPos(x0 * SIM, y0 * SIM)
         self._update_scene_rect()
+        # 强制整视口重绘：选中虚线框/旋转手柄/读数画在前景层，
+        # 范围比图元本身大；只靠 pixmap 变化触发局部重绘会留下旧框残影
+        self.viewport().update()
 
     # ==================================================================
     # 前景层：网格/坐标轴 + 演示层 + 预览 + 选中框
@@ -828,15 +1093,26 @@ class CanvasView(QGraphicsView):
                     painter.drawRect(QRectF(vx * _S + m, vy * _S + m,
                                             side, side))
 
-        # ---- 2. 选中图元的包围盒（虚线 + 四角手柄） ----
-        if self._selected_shape is not None:
-            bbox = self._shape_bbox(self._selected_shape)
+        # ---- 2. 选中图元（可多选）的包围盒 + 手柄 ----
+        if self._selection:
+            bbox = self._sel_bbox()
             if bbox:
                 x0, y0, x1, y1 = bbox
                 pad = 4
                 rect_s = QRectF(x0 - pad, y0 - pad,
                                 x1 - x0 + pad * 2, y1 - y0 + pad * 2)
                 painter.setRenderHint(QPainter.Antialiasing, True)
+                # 多选：逐个成员画淡虚线框，主包围盒画粗虚线
+                if len(self._selection) > 1:
+                    painter.setPen(QPen(QColor(79, 110, 247, 120), 0,
+                                        Qt.DotLine))
+                    painter.setBrush(Qt.NoBrush)
+                    for s in self._selection:
+                        b = self._shape_bbox(s)
+                        if b:
+                            painter.drawRect(QRectF(b[0] - 2, b[1] - 2,
+                                                    b[2] - b[0] + 4,
+                                                    b[3] - b[1] + 4))
                 painter.setPen(QPen(SELECT_COLOR, 0, Qt.DashLine))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(rect_s)
@@ -846,6 +1122,91 @@ class CanvasView(QGraphicsView):
                 # 8 方位手柄：四角 + 四边中点（与 _handle_positions 命中一致）
                 for hx, hy, _axis in self._handle_positions(bbox):
                     painter.drawRect(QRectF(hx - hs / 2, hy - hs / 2, hs, hs))
+                # 旋转手柄：顶边中点上方，连线 + 圆底 + 环形箭头
+                rh = self._rotate_handle(bbox)
+                if rh:
+                    rx, ry = rh
+                    painter.setPen(QPen(SELECT_COLOR, 1))
+                    painter.drawLine(QPointF(rx, ry + 9),
+                                     QPointF(rx, y0 - pad))
+                    painter.setBrush(QBrush(QColor(255, 255, 255)))
+                    painter.setPen(QPen(SELECT_COLOR, 2))
+                    painter.drawEllipse(QPointF(rx, ry), 8, 8)
+                    # 环形箭头：留出缺口的三段弧 + 箭头
+                    arc = QRectF(rx - 4.2, ry - 4.2, 8.4, 8.4)
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawArc(arc, 40 * 16, 260 * 16)
+                    painter.setPen(QPen(SELECT_COLOR, 1))
+                    painter.drawLine(QPointF(rx + 2.2, ry - 5.0),
+                                     QPointF(rx + 5.0, ry - 4.4))
+                    painter.drawLine(QPointF(rx + 5.0, ry - 4.4),
+                                     QPointF(rx + 4.2, ry - 7.2))
+                # 旋转中的定点标记：让"绕包围盒中心旋转"直观可见
+                ctx = self._move_ctx
+                if ctx and ctx.get("mode") == "rotate":
+                    pvx, pvy = ctx["pivot"]
+                    cxp, cyp = pvx * SIM, pvy * SIM
+                    painter.setPen(QPen(SELECT_COLOR, 1))
+                    painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+                    painter.drawEllipse(QPointF(cxp, cyp), 5, 5)
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(SELECT_COLOR))
+                    painter.drawEllipse(QPointF(cxp, cyp), 2, 2)
+                # 拖拽中的实时读数（旋转角度 / 缩放比例 / 位移）
+                self._draw_transform_hud(painter, bbox)
+
+        # ---- 3. 框选矩形 ----
+        if self._rubber is not None:
+            x0, y0, x1, y1 = self._rubber
+            r = QRectF(min(x0, x1) * SIM, min(y0, y1) * SIM,
+                       abs(x1 - x0) * SIM, abs(y1 - y0) * SIM)
+            painter.setRenderHint(QPainter.Antialiasing, False)
+            painter.setPen(QPen(SELECT_COLOR, 1, Qt.DashLine))
+            painter.setBrush(QBrush(QColor(79, 110, 247, 28)))
+            painter.drawRect(r)
+
+        # ---- 4. 工具叠层（裁剪窗口等） ----
+        if callable(self.tool_overlay):
+            painter.save()
+            self.tool_overlay(painter)
+            painter.restore()
+
+    def _draw_transform_hud(self, painter, bbox):
+        """拖拽变换时在包围盒下方显示实时读数（角度/比例/位移）。
+
+        直接操作手柄也能看到数值，不必依赖右侧面板输入。
+        """
+        ctx = self._move_ctx
+        if not ctx:
+            return
+        mode = ctx.get("mode", "")
+        if mode == "rotate":
+            text = f"旋转 {ctx.get('angle', 0.0):.1f}°"
+        elif mode == "scale_uni":
+            text = f"缩放 {ctx.get('f', 1.0) * 100:.0f}%"
+        elif mode.startswith("scale"):
+            fx, fy = ctx.get("fx", 1.0), ctx.get("fy", 1.0)
+            text = (f"缩放 {fx * 100:.0f}%" if abs(fx - fy) < 1e-3
+                    else f"缩放 {fx * 100:.0f}% × {fy * 100:.0f}%")
+        elif mode == "move":
+            dx, dy = ctx.get("last", (0, 0))
+            text = f"位移 dx={dx}, dy={-dy}"     # 面板约定：dy 正 = 向上
+        else:
+            return
+        f = QFont(painter.font())
+        f.setPixelSize(12)
+        f.setBold(True)
+        painter.setFont(f)
+        fm = QFontMetricsF(f)
+        tw = fm.horizontalAdvance(text) + 14
+        th = fm.height() + 6
+        x, y = bbox[0], bbox[3] + 10
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(79, 110, 247, 220)))
+        painter.drawRoundedRect(QRectF(x, y, tw, th), 4, 4)
+        painter.setPen(QPen(QColor("#FFFFFF")))
+        painter.drawText(QRectF(x, y, tw, th), Qt.AlignCenter, text)
 
     # ==================================================================
     # 背景：桌面衬底 + 纸投影/纸边（跟随可增长范围）
@@ -922,6 +1283,9 @@ class CanvasView(QGraphicsView):
         self.zoom_changed.emit(self.transform().m11())
 
     def contextMenuEvent(self, event):
+        if self._menu_suppressed:
+            self._menu_suppressed = False
+            return
         self.context_requested.emit(event.globalPos())
 
     def zoom_step(self, factor: float):
@@ -950,29 +1314,53 @@ class CanvasView(QGraphicsView):
                               else QPointF(self.mapFromGlobal(QCursor.pos())))
             self.setCursor(Qt.ClosedHandCursor)
             return
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+        # 选中态优先级：手柄（旋转/缩放）→ 包围盒内（移动）→ 工具
         if event.button() == Qt.LeftButton and self._selected_shape is not None:
-            # 选中态三优先：8 方位手柄=缩放 → 包围盒内=移动 → 其他=绘制
             # 命中判定必须用未量化的场景点：手柄位于包围盒边缘，
             # 若先按模拟格取整会偏差最多 SIM-1 像素，超过命中容差
             spt = self.mapToScene(event.position().toPoint())
-            fpt = QPointF(spt.x() / SIM, spt.y() / SIM)   # 未量化模拟坐标
             handle = self._handle_hit(spt)
+            # 手柄必须先于"Shift 加选"判定：Shift+手柄 = 等比缩放/15°吸附，
+            # 否则 Shift 一直被多选分支吃掉，等比缩放永远按不出来
             if handle is not None:
-                self.begin_scale(handle, fpt)
+                fpt = QPointF(spt.x() / SIM, spt.y() / SIM)
+                if handle[2] == "rotate":
+                    self.begin_rotate(fpt)
+                else:
+                    self.begin_scale(handle, fpt)
                 return
-            if self._bbox_contains(spt):
-                # Ctrl 按住 = 以锚点为定点等比缩放（圆/椭圆即圆心定点）
-                self.begin_move(fpt,
-                                scale=bool(event.modifiers() & Qt.ControlModifier))
-                return
+            # Shift+点击（加选减选）交给支持多选的工具；其余走移动
+            if not (shift and getattr(self.tool,
+                                      "handles_shift_selection", False)):
+                if self._bbox_contains(spt):
+                    # Ctrl 按住 = 以锚点为定点等比缩放（圆/椭圆即圆心定点）
+                    self.begin_move(
+                        QPointF(spt.x() / SIM, spt.y() / SIM),
+                        scale=bool(event.modifiers() & Qt.ControlModifier))
+                    return
         if event.button() == Qt.LeftButton and self.tool:
-            # 开始绘制即取消列表选中态（避免选中框残留在新图元上）
-            if self._selected_shape is not None:
+            # 绘制型工具开始绘制时取消选中；多选/变换工具自己管理选中态
+            # （若在此预先清空，Shift 加选会先把旧选集丢掉，永远只剩 1 个）
+            if self._selected_shape is not None and \
+                    not getattr(self.tool, "handles_shift_selection", False):
                 self.set_selected_shape(None)
             self.tool.on_press(self._to_pos(event), event)
         elif event.button() == Qt.RightButton and self.tool:
+            was_drawing = bool(getattr(self.tool, "is_drawing", False))
             self.tool.on_right_click(self._to_pos(event), event)
+            # 工具把右键当作"闭合多边形/窗口"：这一次右键不再弹上下文菜单
+            if was_drawing:
+                self._menu_suppressed = True
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """双击透传给工具（裁剪工具用它确认挖除）。"""
+        if event.button() == Qt.LeftButton and self.tool:
+            self.tool.on_double_click(self._to_pos(event), event)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._panning:
@@ -1035,7 +1423,7 @@ class CanvasView(QGraphicsView):
         if s is None or (dx == 0 and dy == 0):
             return
         entries = []
-        for m in self._transform_group(s):
+        for m in self._selection_members():
             before = snapshot(m)
             translate(m, dx, dy)
             entries.append((m, before, snapshot(m)))
@@ -1044,6 +1432,11 @@ class CanvasView(QGraphicsView):
         self.document_changed.emit()
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Backspace and not event.isAutoRepeat() \
+                and not (self.tool and getattr(self.tool, "is_drawing", False)):
+            # 选中图元时 Backspace = 删除（绘制多边形过程中仍归工具退点）
+            if self.delete_selection():
+                return
         if event.key() == Qt.Key_Escape and not event.isAutoRepeat():
             # Esc：取消移动中的图元 / 取消进行中的图元（PS/Figma 惯例）
             if self._move_ctx:

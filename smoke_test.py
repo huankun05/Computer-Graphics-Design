@@ -50,7 +50,8 @@ discover()
 mods = all_modules()
 expect(len(mods) >= 2, f"发现 {len(mods)} 个模块: {[m.name for m in mods]}")
 tool_classes = [c for m in mods for c in m.tool_classes]
-expect(len(tool_classes) == 8, f"工具类共 {len(tool_classes)} 个（应为 8：填充合一）")
+expect(len(tool_classes) == 9,
+       f"工具类共 {len(tool_classes)} 个（模块二 7 + 变换 1 + 裁剪 1）")
 
 # ---------------------------------------------------------------------
 # 2. 画布 + 工具交互（预览 → 提交）
@@ -305,7 +306,8 @@ pt.cancel()
 expect(len(pt._verts) == 0, "Esc 取消清空顶点")
 
 # 6.7 主窗口 UI 状态
-expect(len(win._tool_classes) == 8, "主窗口工具加载 8 个（填充合一）")
+expect(len(win._tool_classes) == 9,
+       "主窗口工具加载 9 个（模块二 7 + 变换 1 + 裁剪 1）")
 cmp_tool = win._tool_classes[4]
 expect(cmp_tool.name == "算法对比" and len(cmp_tool.algorithm_options) == 2,
        "对比工具：可选直线/圆两种对比对")
@@ -432,8 +434,12 @@ cv.mousePressEvent(_mouse(_QEvent.MouseButtonPress, hpos.x(), hpos.y()))
 cv.mouseMoveEvent(_mouse(_QEvent.MouseMove, vp3.x(), vp3.y()))
 cv.mouseReleaseEvent(_mouse(_QEvent.MouseButtonRelease, vp3.x(), vp3.y()))
 app.processEvents()
-expect(sc.r > 10 and sc.center == (30, 30),
-       f"E 手柄向右拖：等比放大 r 10→{sc.r}，圆心定点不动")
+# 单向手柄 = 非等比缩放：圆按真实仿射变成椭圆（rx 拉长、ry 不变），
+# 圆心定点不动（旧实现只把 r 乘 fx，包围盒与几何不一致）
+expect(isinstance(sc, EllipseShape) and sc.rx > 10 and sc.ry == 10
+       and sc.center == (30, 30),
+       f"E 手柄向右拖：圆→椭圆 rx 10→{getattr(sc, 'rx', '?')}，"
+       f"圆心定点不动")
 
 print("[6c] 右栏窄宽回归（内容体不得被最宽行撑出视口）")
 win.resize(960, 640); app.processEvents()
@@ -487,8 +493,9 @@ expect(True, "网格前景层绘制 + 800% 极限缩放无死循环")
 
 # 7.2 演示页加载
 demo_view = win.demo_view
-expect(len(demo_view._all_pages) == 9,
-       f"演示页 {len(demo_view._all_pages)} 个（模块一 3 + 模块二 6）")
+expect(len(demo_view._all_pages) == 16,
+       f"演示页 {len(demo_view._all_pages)} 个"
+       "（模块一 3 + 模块二 6 + 变换 4 + 裁剪 3）")
 from modules.module02_primitives.demos import (CircleDemo, LineDemo,
                                                CompareDemo, PolygonDemo, FillDemo)
 gd = next(d for d in demo_view._all_pages if isinstance(d, CompareDemo))
@@ -837,7 +844,7 @@ canvas.clear_all()
 for pt in [(31, 28), (33, 30), (31, 32), (29, 30)]:
     _poly.on_press(QPointF(*pt))
 _poly.on_right_click(QPointF(0, 0))            # 菱形边界（四条对角边，8-连通环）
-fill_tool = tools[7]
+fill_tool = tools[6]
 canvas.set_tool(fill_tool)
 canvas.algorithm = "seed4"
 fill_tool.on_press(QPointF(31, 30))            # 菱形内部种子
@@ -862,9 +869,9 @@ for _vx, _vy in ((100, 100), (170, 100), (170, 150), (100, 150)):
     tools[3].on_press(QPointF(_vx, _vy))
 tools[3].on_right_click(QPointF(0, 0))          # 闭合矩形多边形
 _poly = canvas.shapes[-1]
-canvas.set_tool(tools[7])                        # 油漆桶
+canvas.set_tool(tools[6])                        # 油漆桶
 canvas.algorithm = "scanline"
-tools[7].on_press(QPointF(130, 120))
+tools[6].on_press(QPointF(130, 120))
 _scan = canvas.shapes[-1]
 expect(_scan.kind == KIND_RASTER_FILL and len(_scan.pixels) > 500
        and (130, 120) in _scan.pixels,
@@ -876,7 +883,7 @@ canvas.clear_all()
 canvas.set_tool(tools[0])
 tools[0].on_press(QPointF(100, 100))
 tools[0].on_release(QPointF(300, 200))             # 一条测试直线
-er = tools[6]
+er = tools[5]
 canvas.set_tool(er)
 n_before = len(canvas.shapes)
 target = canvas.shapes[0]
@@ -896,8 +903,8 @@ expect(mid not in set(_rz2(target2)[0]), "被擦像素不再输出")
 canvas.undo()
 expect(mid not in target2.erased, "像素擦除可撤销")
 
-# 7.6b 选择/移动工具：点选 + 拖拽移动 + 列表联动
-sel_tool = tools[5]
+# 7.6b 二维变换工具（原选择/移动已合并）：点选 + 拖拽移动 + 列表联动
+sel_tool = tools[7]
 canvas.set_tool(sel_tool)
 canvas.clear_all()
 canvas.set_tool(tools[0])
@@ -906,15 +913,17 @@ tools[0].on_release(QPointF(300, 200))     # 一条线 (5,5)-(15,10)
 canvas.set_tool(sel_tool)
 sel_tool.on_press(QPointF(200, 150))      # 第一次按下：选中
 sel_tool.on_release(QPointF(200, 150))
-expect(canvas._selected_shape is canvas.shapes[0], "选择工具点选命中图元")
-sel_tool.on_press(QPointF(200, 150))      # 第二次按下（已选中）→ 进入移动
-sel_tool.on_move(QPointF(220, 170))
-sel_tool.on_move(QPointF(260, 190))
-sel_tool.on_release(QPointF(260, 190))
+expect(canvas._selected_shape is canvas.shapes[0], "变换工具点选命中图元")
+# 选中后拖包围盒内 = 平移（走画布统一入口）
+canvas.begin_move(QPointF(200, 150))
+canvas.update_move(QPointF(220, 170))
+canvas.update_move(QPointF(260, 190))
+canvas.end_move()
 expect(canvas.shapes[0].p0 == (160, 140),
        f"拖拽移动提交（p0={canvas.shapes[0].p0}，原 (100,100)+位移(60,40)）")
 expect(canvas.document.can_undo, "移动入撤销栈")
 sel_tool.on_press(QPointF(1000, 700))     # 空白处
+sel_tool.on_release(QPointF(1000, 700))
 expect(canvas._selected_shape is None, "空白点击取消选中")
 
 # 7.7 可增长画布：向负方向绘制 → 纸自动扩张
@@ -1125,8 +1134,8 @@ demo_view.player.pause()
 demo_view._on_replay_finished()    # 手画即回放播完：圆恢复显示再选择
 demo_view.btn_select.click()
 app.processEvents()
-from modules.module02_primitives.tools import SelectMoveTool as _SMT
-expect(isinstance(demo_view.canvas.tool, _SMT), "选择图元按钮 → 选择/移动工具")
+from modules.module03_transform2d.tools import Transform2DTool as _T2D
+expect(isinstance(demo_view.canvas.tool, _T2D), "选择图元按钮 → 二维变换工具")
 demo_view.canvas.tool.on_press(QPointF(59, 20))   # 点轮廓选中
 expect(demo_view.canvas._selected_shape is _plain,
        "选择工具点击圆 → 图元选中（可拖动/微调）")
