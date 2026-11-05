@@ -18,7 +18,7 @@
 from typing import Callable, Dict, List
 import math
 
-from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF
+from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, Signal
 from PySide6.QtGui import (QColor, QPainter, QPen, QBrush, QPolygonF,
                            QImage, QFont, QLinearGradient)
 from PySide6.QtWidgets import (QWidget, QFrame, QLabel, QSlider,
@@ -68,6 +68,30 @@ def _hex(r, g, b) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+_CALC_FONT = '"Consolas", "Microsoft YaHei UI", monospace'
+
+
+def _calc_sec(title: str, *lines: str) -> str:
+    """计算过程卡的一节：11px 灰步骤名 + 13px 等宽代入行（150% 行距）。"""
+    body = "<br>".join(lines)
+    return (f"<div style='margin-top:9px'>"
+            f"<div style='color:{theme.TEXT_2}; font-size:11px;"
+            f" font-weight:600'>{title}</div>"
+            f"<div style='font-family:{_CALC_FONT}; font-size:13px;"
+            f" color:{theme.TEXT_1}; line-height:135%'>{body}</div>"
+            f"</div>")
+
+
+def _calc_html(*parts: str) -> str:
+    return (f"<div style='font-family:{_CALC_FONT}; font-size:13px;"
+            f" line-height:150%'>" + "".join(parts) + "</div>")
+
+
+def _res(s: str) -> str:
+    """最终结果：唯一使用主题色加粗的位置（中间量保持素色）。"""
+    return f"<span style='color:{theme.ACCENT}; font-weight:600'>{s}</span>"
+
+
 # =====================================================================
 # 演示页描述结构（演示壳按 kind="widget" 分支装载）
 # =====================================================================
@@ -79,12 +103,14 @@ class ColorPage:
     """
 
     def __init__(self, title: str, icon: str, variables: Dict[str, str],
-                 formula: str, factory: Callable[[], QWidget]):
+                 formula: str, factory: Callable[[], QWidget],
+                 concept: str = ""):
         self.title = title
         self.icon = icon
         self.variables = variables            # 右侧"决策项监视"说明行
         self.formula = formula                # 右侧公式卡全文
         self.factory = factory                # 创建页面控件
+        self.concept = concept                # 概念说明卡的空间/配色补充
         self.kind = "widget"                  # 演示壳分支标记（区别于画布页）
 
 
@@ -641,6 +667,8 @@ class RgbCubePage(QWidget):
     布局：左侧立方体画布（自绘），右侧 R/G/B 滑杆 + 色块 + HEX。
     """
 
+    calc_changed = Signal()          # 参数变化 → 右侧"计算过程"卡重算
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rgb = (79, 110, 247)
@@ -712,13 +740,6 @@ class RgbCubePage(QWidget):
             side.addWidget(row3)
         self._guard = False                  # 双向同步防回环标志
 
-        tip = QLabel("C/M/Y = RGB 的互补量（C=100−R，M=100−G，\n"
-                     "Y=100−B）。拖任意一侧滑杆，另一侧\n"
-                     "三个分量同步换算。")
-        tip.setObjectName("secondary")
-        tip.setWordWrap(True)
-        side.addWidget(tip)
-
         # ---- 底部：当前颜色大展示（加色/减色两种读数） ----
         side.addStretch()
         self.swatch = _Swatch()
@@ -777,6 +798,34 @@ class RgbCubePage(QWidget):
         self._views[0].set_point(r, g, self._rgb)   # 正视图：R-G
         self._views[1].set_point(r, b, self._rgb)   # 俯视图：R-B
         self._views[2].set_point(b, g, self._rgb)   # 侧视图：G-B
+        self.calc_changed.emit()
+
+    def derivation_html(self) -> str:
+        """右侧"计算过程"卡：RGB → 归一化 → 三视图 → CMY → HEX（精简四步）。"""
+        r, g, b = self._rgb
+        rp, gp, bp = r / 255, g / 255, b / 255
+        c, m, y = rgb_to_cmy(*self._rgb)
+        return _calc_html(
+            _calc_sec("① 归一化",
+                      f"RGB = ({r}, {g}, {b}) 各分量 ÷255",
+                      f"R′ = {r}/255 = {rp:.3f}",
+                      f"G′ = {g}/255 = {gp:.3f}",
+                      f"B′ = {b}/255 = {bp:.3f}",
+                      f"→ P = ({rp:.3f}, {gp:.3f}, {bp:.3f})"),
+            _calc_sec("② 三视图投影（沿某轴看立方体）",
+                      f"正视 (R′,G′) = ({rp:.3f}, {gp:.3f})",
+                      f"俯视 (R′,B′) = ({rp:.3f}, {bp:.3f})",
+                      f"侧视 (G′,B′) = ({gp:.3f}, {bp:.3f})"),
+            _calc_sec("③ CMY 互补（同一颜色的另一种记法）",
+                      f"C = 100×(1−{rp:.3f}) = {c:.1f}",
+                      f"M = 100×(1−{gp:.3f}) = {m:.1f}",
+                      f"Y = 100×(1−{bp:.3f}) = {y:.1f}",
+                      f"反向 R = 255×(1−{c:.1f}/100) = "
+                      f"{255 * (1 - c / 100):.1f}"),
+            _calc_sec("④ 十六进制",
+                      f"R={r:02X}  G={g:02X}  B={b:02X} → "
+                      f"{_res(_hex(r, g, b))}"),
+        )
 
     def _set_two(self, i1: int, v1: float, i2: int, v2: float):
         """三视图拖动 → 设置对应两个分量（第三分量保持不变）。"""
@@ -913,6 +962,8 @@ class HsvConePage(QWidget):
     """HSV 交互页：左侧 = 六棱锥 3D 视图（可拖拽旋转）+ 俯视图 /
     轴截面两张平面图，右侧 H/S/V 滑杆。"""
 
+    calc_changed = Signal()          # 参数变化 → 右侧"计算过程"卡重算
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._hsv = (230.0, 68.0, 97.0)
@@ -952,21 +1003,14 @@ class HsvConePage(QWidget):
             row2.slider.valueChanged.connect(self._on_change)
             self._rows.append(row2)
             side.addWidget(row2)
+        # 色块/HEX 沉到栏底（与 RGB 立方体页一致），不留中部空档
+        side.addStretch()
         self.swatch = _Swatch()
         side.addWidget(self.swatch)
         self.hex_lab = QLabel()
         self.hex_lab.setObjectName("mono")
         self.hex_lab.setAlignment(Qt.AlignCenter)
         side.addWidget(self.hex_lab)
-        tip = QLabel("六棱锥即 HSV 空间（PPT 第 16/20 页）：\n"
-                     "顶面六边形 = V=1，六个顶点按 H 依次为\n"
-                     "红→黄→绿→青→蓝→品红，中心白(1,0)；\n"
-                     "锥尖 = 黑(0,0)，V 轴过锥心垂直向上。\n"
-                     "下方俯视图/截面图均可点击拖动调参。")
-        tip.setObjectName("secondary")
-        tip.setWordWrap(True)
-        side.addWidget(tip)
-        side.addStretch()
         w = QFrame()
         w.setFixedWidth(280)
         w.setLayout(side)
@@ -981,6 +1025,44 @@ class HsvConePage(QWidget):
         self.field.set_hsv(self._hsv)
         self.top_view.set_hsv(self._hsv)
         self.sv_view.set_hsv(self._hsv)
+        self.calc_changed.emit()
+
+    def derivation_html(self) -> str:
+        """右侧"计算过程"卡：HSV → RGB 五步代入（每步一行，结果收尾）。"""
+        h, s, v = self._hsv
+        sn, vn = s / 100, v / 100
+        c = vn * sn
+        hh = h / 60
+        i = int(h // 60) % 6
+        x = c * (1 - abs(hh % 2 - 1))
+        m = vn - c
+        triples = [(c, x, 0), (x, c, 0), (0, c, x),
+                   (0, x, c), (x, 0, c), (c, 0, x)]
+        names = ["(C, X, 0)", "(X, C, 0)", "(0, C, X)",
+                 "(0, X, C)", "(X, 0, C)", "(C, 0, X)"]
+        rp, gp, bp = triples[i]
+        rgb = hsv_to_rgb(h, s, v)
+        return _calc_html(
+            _calc_sec("① 归一化",
+                      f"H = {h:.0f}°　S = {s:.0f} → s = {sn:.3f}",
+                      f"V = {v:.0f} → v = {vn:.3f}"),
+            _calc_sec("② 纯色分量（chroma）",
+                      f"C = v·s = {vn:.3f}×{sn:.3f} = {c:.3f}"),
+            _calc_sec("③ 色相落在哪一段",
+                      f"H/60 = {h:.0f}/60 = {hh:.3f}",
+                      f"→ 第 {i + 1} 段（{i * 60}°–{i * 60 + 60}°）"),
+            _calc_sec("④ 中间分量",
+                      f"(H/60) mod 2 = {hh % 2:.3f}",
+                      f"X = C×(1−|{hh % 2:.3f}−1|)",
+                      f"= {c:.3f}×{1 - abs(hh % 2 - 1):.3f} → {x:.3f}"),
+            _calc_sec("⑤ 排列合成（加白常量 m）",
+                      f"m = v−C = {vn:.3f}−{c:.3f} = {m:.3f}",
+                      f"{names[i]} = ({rp:.3f}, {gp:.3f}, {bp:.3f})",
+                      f"R = ({rp:.3f}+{m:.3f})×255 = {rgb[0]}",
+                      f"G = ({gp:.3f}+{m:.3f})×255 = {rgb[1]}",
+                      f"B = ({bp:.3f}+{m:.3f})×255 = {rgb[2]}",
+                      f"→ {_res(f'({rgb[0]}, {rgb[1]}, {rgb[2]})')}"),
+        )
 
     def _set_hs(self, h: float, s: float):
         """俯视图拖动 → 设 H、S（V 不变）。"""
@@ -1148,8 +1230,10 @@ class _HexconeCanvas(RotatingCanvas):
 # =====================================================================
 class ConvertPage(QWidget):
     """转换过程推导页：色轮 + S-V 截面（可拖，HSV→RGB 反向写回），
-    拖 R/G/B 逐步代入公式算 H/S/V 并反向验证——归档"转换过程可视化"
-    的移植升级版：RGB 与 HSV 双向可调。"""
+    拖 R/G/B 在右侧"计算过程"卡逐步代入公式算 H/S/V 并反向验证——
+    归档"转换过程可视化"的移植升级版：RGB 与 HSV 双向可调。"""
+
+    calc_changed = Signal()          # 参数变化 → 右侧"计算过程"卡重算
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1167,13 +1251,12 @@ class ConvertPage(QWidget):
         views.setSpacing(16)
         self.ring = _HueRing(on_pick=self._on_ring_pick)
         self.sv_view = _SVSection(on_pick=self._on_sv_pick)
+        # 推导搬到右侧后，两张图改为可伸展（占满中部，不留大片空白）
         for v in (self.ring, self.sv_view):
-            v.setFixedSize(320, 235)
-        views.addStretch(1)
-        views.addWidget(self.ring)
-        views.addWidget(self.sv_view)
-        views.addStretch(1)
-        root.addLayout(views)
+            v.setMinimumSize(300, 215)
+        views.addWidget(self.ring, stretch=1)
+        views.addWidget(self.sv_view, stretch=1)
+        root.addLayout(views, stretch=1)
 
         # ---- 2. RGB 滑杆（全宽三行，不再挤窄列） ----
         self._rows = []
@@ -1206,18 +1289,7 @@ class ConvertPage(QWidget):
         # ---- 4. 色相条（可点击/拖动直接调 H） ----
         self.hue_bar = _HueBar(on_pick=self._on_ring_pick)
         root.addWidget(self.hue_bar)
-
-        # ---- 5. 推导面板 ----
-        self.derive = QLabel()
-        self.derive.setTextFormat(Qt.PlainText)
-        self.derive.setStyleSheet(
-            f"font-family: {theme.UI_FONT}; font-size: 13px;"
-            f" color: {theme.TEXT_1}; background: {theme.BG_WINDOW};"
-            f" border: 1px solid {theme.BORDER}; border-radius: 8px;"
-            f" padding: 12px;")
-        self.derive.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.derive.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        root.addWidget(self.derive, stretch=1)
+        # 推导过程统一放右侧"计算过程"卡（页面内不再重复一份）
         self._on_change()
 
     # ---- HSV 侧拖动 → 反向写回 RGB 滑杆（互相转换的"互相"） ----
@@ -1237,41 +1309,39 @@ class ConvertPage(QWidget):
         for row, val in zip(self._rows, (r, g, b)):
             row.slider.setValue(val)
 
-    def _on_change(self):
+    def _snapshot(self) -> Dict:
+        """当前滑杆值 → 推导所需的中间量（H 表达式与反向验证共用）。"""
         r, g, b = (x.value() for x in self._rows)
         h, s, v = rgb_to_hsv(r, g, b)
         rp, gp, bp = r / 255, g / 255, b / 255
         mx, mn = max(rp, gp, bp), min(rp, gp, bp)
         d = mx - mn
         who = "R" if mx == rp else ("G" if mx == gp else "B")
+        return {"r": r, "g": g, "b": b, "h": h, "s": s, "v": v,
+                "rp": rp, "gp": gp, "bp": bp, "mx": mx, "mn": mn,
+                "d": d, "who": who}
+
+    @staticmethod
+    def _h_block(t: Dict):
+        """色相一节：小标题 + 代入行（公式与结果拆两行，避免断在 unit 中间）。"""
+        d = t["d"]
         if d == 0:
-            h_line = "H：Δ = 0（灰色，无色相，约定 H = 0°）"
-        elif mx == rp:
-            h_line = (f"H：Max=R → H = 60°×(({gp:.3f}−{bp:.3f})/{d:.3f} mod 6)"
-                      f" = {h:.1f}°")
-        elif mx == gp:
-            h_line = (f"H：Max=G → H = 60°×(({bp:.3f}−{rp:.3f})/{d:.3f}+2)"
-                      f" = {h:.1f}°")
+            return "⑤ 色相 H（Δ = 0）", ["Δ = 0 → 约定 H = 0°"]
+        if t["mx"] == t["rp"]:
+            expr = (f"H = 60×(({t['gp']:.3f}−{t['bp']:.3f})"
+                    f"/{d:.3f} mod 6)")
+        elif t["mx"] == t["gp"]:
+            expr = (f"H = 60×(({t['bp']:.3f}−{t['rp']:.3f})"
+                    f"/{d:.3f} + 2)")
         else:
-            h_line = (f"H：Max=B → H = 60°×(({rp:.3f}−{gp:.3f})/{d:.3f}+4)"
-                      f" = {h:.1f}°")
-        rr, gg, bb = hsv_to_rgb(h, s, v)
-        ok = "一致 ✓" if (rr, gg, bb) == (r, g, b) else \
-            f"偏差 ({rr},{gg},{bb})（四舍五入误差）"
-        self.derive.setText(
-            f"输入 RGB = ({r}, {g}, {b})\n"
-            f"\n"
-            f"① 归一化   R'={rp:.3f}  G'={gp:.3f}  B'={bp:.3f}\n"
-            f"② 求最值   Max = {mx:.3f} ({who})   Min = {mn:.3f}"
-            f"   Δ = {d:.3f}\n"
-            f"③ V 明度   V = Max = {mx:.3f} → {v:.0f}\n"
-            f"④ S 饱和   S = Δ/Max = {d:.3f}/{mx:.3f}"
-            f" = {s:.0f}" + ("  （Max=0 时 S=0）\n" if mx == 0 else "\n") +
-            f"⑤ H 色相   {h_line}\n"
-            f"\n"
-            f"结果  HSV = ({h:.1f}°, {s:.0f}, {v:.0f})"
-            f"   HEX = {_hex(r, g, b)}\n"
-            f"反向验证  HSV→RGB = ({rr}, {gg}, {bb})  与输入{ok}")
+            expr = (f"H = 60×(({t['rp']:.3f}−{t['gp']:.3f})"
+                    f"/{d:.3f} + 4)")
+        return f"⑤ 色相 H（Max = {t['who']}′）", [expr, f"→ {t['h']:.1f}°"]
+
+    def _on_change(self):
+        t = self._snapshot()
+        r, g, b, h, s, v = (t["r"], t["g"], t["b"],
+                            t["h"], t["s"], t["v"])
         self.swatch.set_color(QColor(r, g, b))
         self.hex_lab.setText(_hex(r, g, b))
         c2, m2, y2 = rgb_to_cmy(r, g, b)
@@ -1279,6 +1349,40 @@ class ConvertPage(QWidget):
         self.hue_bar.set_hue(h)
         self.ring.set_hsv((h, s, v))
         self.sv_view.set_hsv((h, s, v))
+        self.calc_changed.emit()
+
+    def derivation_html(self) -> str:
+        """右侧"计算过程"卡：RGB → HSV 五步代入 + 反向验证。"""
+        t = self._snapshot()
+        r, g, b = t["r"], t["g"], t["b"]
+        rr, gg, bb = hsv_to_rgb(t["h"], t["s"], t["v"])
+        if (rr, gg, bb) == (r, g, b):
+            verify = f"HSV→RGB = ({rr}, {gg}, {bb}) ✓"
+        else:
+            verify = (f"HSV→RGB = ({rr}, {gg}, {bb})"
+                      f"（差 ≤1，四舍五入）")
+        hsv_txt = f"({t['h']:.1f}°, {t['s']:.0f}, {t['v']:.0f})"
+        h_title, h_lines = self._h_block(t)
+        return _calc_html(
+            _calc_sec("① 归一化",
+                      f"RGB = ({r}, {g}, {b}) 各分量 ÷255",
+                      f"R′ = {t['rp']:.3f}　"
+                      f"G′ = {t['gp']:.3f}　"
+                      f"B′ = {t['bp']:.3f}"),
+            _calc_sec("② 最值与差",
+                      f"Max = {t['mx']:.3f}（{t['who']}′）　"
+                      f"Min = {t['mn']:.3f}",
+                      f"Δ = {t['mx']:.3f}−{t['mn']:.3f} = {t['d']:.3f}"),
+            _calc_sec("③ 明度 V",
+                      f"V = Max = {t['mx']:.3f} → {t['v']:.0f}"),
+            _calc_sec("④ 饱和度 S",
+                      f"S = Δ/Max = {t['d']:.3f}/{t['mx']:.3f}"
+                      f" = {t['s']:.0f}"),
+            _calc_sec(h_title, *h_lines),
+            _calc_sec("结果",
+                      f"HSV = {_res(hsv_txt)}　HEX = {_hex(r, g, b)}",
+                      verify),
+        )
 
 
 class _HueBar(QWidget):
@@ -1359,12 +1463,14 @@ def create_demos() -> List[ColorPage]:
             variables={"R/G/B": "三个分量各 0–255，对应立方体三根轴",
                        "顶点": "8 个顶点 = 黑/白 + 三原色 + 两两混合",
                        "主对角线": "黑(0,0,0) → 白(255,255,255) 灰度轴"},
-            formula=("RGB 立方体\n"
-                     "任意色 C = (R, G, B)，R,G,B ∈ [0,255]\n"
-                     "三原色相加混合：\n"
-                     "  R+G=黄  G+B=青  B+R=品红\n"
-                     "  R+G+B=白（全 1）／黑（全 0）"),
+            formula=("C = (R, G, B)，各分量 0–255\n"
+                     "加色：R+G=黄　G+B=青　B+R=品红\n"
+                     "满值 → 白；全零 → 黑；三分量相等 → 灰\n"
+                     "减色（CMY 互补）\n"
+                     "C=100(1−R′)　M=100(1−G′)　Y=100(1−B′)"),
             factory=RgbCubePage,
+            concept=("· 立方体边长 1，任意颜色 = 三个 0–1 坐标\n"
+                     "· 三视图 = 沿某一轴看立方体的投影，图内可直接拖动调参"),
         ),
         ColorPage(
             title="HSV 六棱锥",
@@ -1372,14 +1478,16 @@ def create_demos() -> List[ColorPage]:
             variables={"H": "色相 0–360°，顶面六边形顶点角",
                        "S": "饱和度 0–100，到中心竖轴的距离",
                        "V": "明度 0–100，六棱锥高度（锥尖黑）"},
-            formula=("HSV 六棱锥（PPT：从 RGB 立方体演变）\n"
-                     "沿 RGB 立方体 白→黑 对角线看过去 = 顶面六边形\n"
-                     "顶面 V=1：红0° 黄60° 绿120° 青180° 蓝240° 品红300°\n"
-                     "锥尖黑(0,0)，中心白(1,0)，V 轴过锥心\n"
-                     "S：到中心竖轴的水平距离（锥面=1，轴=0）\n"
-                     "V：高度（顶面全纯色，向下渐黑=色调）\n"
-                     "人眼调色直觉：先选色相，再调深浅浓淡"),
+            formula=("H ∈ [0,360°)，S、V 取 0–100\n"
+                     "（计算前 s=S/100、v=V/100）\n"
+                     "C = v·s\n"
+                     "X = C(1−|(H/60) mod 2 − 1|)\n"
+                     "m = v − C\n"
+                     "H 每 60° 一段，按 (C,X,0)/(X,C,0)… 排列\n"
+                     "RGB = ((r+m)·255, (g+m)·255, (b+m)·255)"),
             factory=HsvConePage,
+            concept=("· 顶面六边形 V=1：红0° 黄60° 绿120° 青180° 蓝240° 品红300°，中心白\n"
+                     "· 俯视图拖 H/S，轴截面拖 S/V"),
         ),
         ColorPage(
             title="RGB⇄HSV 转换推导",
@@ -1387,14 +1495,15 @@ def create_demos() -> List[ColorPage]:
             variables={"R'G'B'": "先归一化到 0–1",
                        "Max/Min/Δ": "三分量最大/最小/差",
                        "V/S/H": "由 Max、Δ、Max 位置逐步导出"},
-            formula=("RGB → HSV\n"
-                     "V = Max(R',G',B')\n"
-                     "S = Δ/Max（Δ=0 时 S=0）\n"
-                     "Max=R: H = 60°×((G'−B')/Δ mod 6)\n"
-                     "Max=G: H = 60°×((B'−R')/Δ + 2)\n"
-                     "Max=B: H = 60°×((R'−G')/Δ + 4)\n"
-                     "HSV → RGB：C=V·S，X=C(1−|(H/60)mod2−1|)，\n"
-                     "按 H 所在 60° 区段取 (C,X,0) 排列再 +m=V−C"),
+            formula=("V = Max(R′,G′,B′)\n"
+                     "S = Δ/Max（Δ=Max−Min；Max=0 时 S=0）\n"
+                     "Max=R′：H = 60((G′−B′)/Δ mod 6)\n"
+                     "Max=G′：H = 60((B′−R′)/Δ + 2)\n"
+                     "Max=B′：H = 60((R′−G′)/Δ + 4)\n"
+                     "反向：C=V·S，m=V−C，按 H 区段排列后 +m"),
             factory=ConvertPage,
+            concept=("· RGB 面向发光设备；HSV 贴合“先选色相、再调深浅”的直觉\n"
+                     "· 色轮 = H 角度 + S 半径；截面 = S/V 平面\n"
+                     "· 双向可调：拖 RGB 算 HSV，拖色轮/截面写回 RGB"),
         ),
     ]

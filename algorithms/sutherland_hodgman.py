@@ -19,7 +19,8 @@
 from typing import List, Sequence, Tuple
 
 from algorithms.line_bresenham import bresenham_line
-from algorithms.steps import Step
+from algorithms.steps import (GUIDE_HIT, Step, line_guide, point_guide,
+                              rect_guide)
 
 Rect = Tuple[int, int, int, int]
 Point = Tuple[float, float]
@@ -93,55 +94,84 @@ def polygon_outline(points: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return sorted(set(out))
 
 
-def _rect_perimeter(rect: Rect) -> List[Tuple[int, int]]:
-    rx0, ry0, rx1, ry1 = rect
-    pts = set()
-    for x in range(rx0, rx1 + 1):
-        pts.add((x, ry0))
-        pts.add((x, ry1))
-    for y in range(ry0, ry1 + 1):
-        pts.add((rx0, y))
-        pts.add((rx1, y))
-    return sorted(pts)
-
-
 _EDGE_CN = {"left": "左边界", "right": "右边界",
             "top": "上边界", "bottom": "下边界"}
 
 
+def _edge_guide(edge: str, rect: Rect):
+    """当前被裁边界的高亮线（左/右为竖线，上/下为横线）。"""
+    rx0, ry0, rx1, ry1 = rect
+    if edge in ("left", "right"):
+        x = rx0 if edge == "left" else rx1
+        return line_guide((x, ry0), (x, ry1), "#F76B15", dash=False)
+    y = ry0 if edge == "top" else ry1
+    return line_guide((rx0, y), (rx1, y), "#F76B15", dash=False)
+
+
+def _vertex_guides(pts: List[Tuple[int, int]]):
+    """输出顶点序列的编号点注记（P0…Pn-1）。"""
+    return [point_guide(p, f"P{i}", GUIDE_HIT) for i, p in enumerate(pts)]
+
+
 def clip_polygon_steps(points: Sequence[Tuple[int, int]],
                        rect: Rect) -> List[Step]:
-    """多边形裁剪步骤流：每裁完一条边界输出一步（窗口 + 当前多边形）。"""
-    border = _rect_perimeter(rect)
+    """多边形裁剪步骤流：每裁完一条边界输出一步（窗口 + 当前多边形）。
+
+    约定（双出口一致）：Step.pixels 只放【当前裁剪结果多边形的轮廓】，
+    窗口边框与当前边界线、顶点编号、交点都放进 guides 注记。
+    每步 values 给出四情形统计（内→内 / 内→外 / 外→内 / 外→外），
+    把 S→E 逐顶点的判定过程写清楚。
+    """
+    frame = rect_guide(rect)
     out = [(float(x), float(y)) for x, y in points]
     steps: List[Step] = []
     start = [(int(round(x)), int(round(y))) for x, y in out]
-    steps.append(Step(sorted(set(border) | set(polygon_outline(start))),
-                      {"阶段": "初始", "顶点数": len(start)},
-                      f"待裁剪多边形：{len(start)} 个顶点"))
+    steps.append(Step(sorted(set(polygon_outline(start))),
+                      {"阶段": "初始", "输入顶点": len(start),
+                       "输出顶点": len(start), "新增交点": 0,
+                       "四情形": "待裁剪"},
+                      f"待裁剪多边形：{len(start)} 个顶点",
+                      guides=[frame, *_vertex_guides(start)]))
     for edge in ("left", "right", "top", "bottom"):
         if not out:
-            steps.append(Step(border, {"阶段": _EDGE_CN[edge], "顶点数": 0},
-                              f"{_EDGE_CN[edge]}：多边形已空"))
+            steps.append(Step([], {"阶段": _EDGE_CN[edge], "输入顶点": 0,
+                                   "输出顶点": 0, "新增交点": 0,
+                                   "四情形": "多边形已空"},
+                              f"{_EDGE_CN[edge]}：多边形已空，无顶点可裁",
+                              guides=[frame, _edge_guide(edge, rect)]))
             break
         src = out
         out = []
-        s = src[-1]
         added = 0
-        for e in src:
-            if _inside(e, edge, rect):
-                if not _inside(s, edge, rect):
-                    out.append(_intersect(s, e, edge, rect))
+        cases = {"内→内": 0, "内→外": 0, "外→内": 0, "外→外": 0}
+        hits: List[Tuple[int, int]] = []
+        for j, e in enumerate(src):
+            s = src[j - 1]
+            s_in = _inside(s, edge, rect)
+            e_in = _inside(e, edge, rect)
+            cases[("内" if s_in else "外") + "→" + ("内" if e_in else "外")] += 1
+            if e_in:
+                if not s_in:
+                    p = _intersect(s, e, edge, rect)
+                    out.append(p)
+                    hits.append((int(round(p[0])), int(round(p[1]))))
                     added += 1
                 out.append(e)
-            elif _inside(s, edge, rect):
-                out.append(_intersect(s, e, edge, rect))
+            elif s_in:
+                p = _intersect(s, e, edge, rect)
+                out.append(p)
+                hits.append((int(round(p[0])), int(round(p[1]))))
                 added += 1
-            s = e
         cur = [(int(round(x)), int(round(y))) for x, y in out]
-        steps.append(Step(sorted(set(border) | set(polygon_outline(cur))),
-                          {"阶段": _EDGE_CN[edge], "顶点数": len(cur),
-                           "新增交点": added},
-                          f"{_EDGE_CN[edge]}：保留 {len(cur)} 个顶点，"
-                          f"新增 {added} 个交点"))
+        case_text = " ".join(f"{k}{v}" for k, v in cases.items())
+        steps.append(Step(
+            sorted(set(polygon_outline(cur))),
+            {"阶段": _EDGE_CN[edge], "输入顶点": len(src),
+             "输出顶点": len(cur), "新增交点": added,
+             "四情形": case_text},
+            f"{_EDGE_CN[edge]}：{len(src)} 个顶点逐边判定"
+            f"（{case_text}）→ 保留 {len(cur)} 个，新增 {added} 个交点",
+            guides=[frame, _edge_guide(edge, rect),
+                    *_vertex_guides(cur),
+                    *[point_guide(h, "交点", GUIDE_HIT) for h in hits]]))
     return steps

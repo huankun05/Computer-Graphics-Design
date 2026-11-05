@@ -29,6 +29,53 @@ from typing import Dict, List, Tuple
 # 像素坐标类型：(x, y)，均为 int
 Pixel = Tuple[int, int]
 
+# ---------------------------------------------------------------------
+# 辅助图元（guides）：算法演算的"黑板注记"，不属于算法输出像素
+# ---------------------------------------------------------------------
+# 教学演示需要看到判定依据（窗口边框、交点、轴心、源点→目标点等），
+# 但这些不是算法产生的像素，不能混进 Step.pixels（否则会污染
+# "末帧像素 = 几何结果"的双出口一致性）。因此统一放进 Step.guides，
+# 由演示叠层单独渲染。全部用纯 dict 描述，algorithms/ 仍不依赖 Qt：
+#   {"kind": "point", "xy": (x, y), "label": "P", "color": "#RRGGBB"}
+#   {"kind": "line",  "a": (x, y), "b": (x, y), "dash": bool, "color": ...}
+#   {"kind": "arrow", "a": (x, y), "b": (x, y), "color": ...}
+#   {"kind": "rect",  "xy": (x0, y0, x1, y1), "color": ...}
+#   {"kind": "label", "xy": (x, y), "text": "...", "color": ...}
+GUIDE_REF = "#8A94A6"      # 辅助/轴心（灰）
+GUIDE_MARK = "#F76B15"     # 源状态/待观察（橙）
+GUIDE_HIT = "#3E63DD"      # 算法产出/交点（蓝）
+
+
+def point_guide(xy: Pixel, label: str = "", color: str = GUIDE_HIT) -> dict:
+    """点注记（交点、端点、轴心、映射点）。"""
+    return {"kind": "point", "xy": (int(xy[0]), int(xy[1])),
+            "label": label, "color": color}
+
+
+def line_guide(a: Pixel, b: Pixel, color: str = GUIDE_REF,
+               dash: bool = True) -> dict:
+    """线注记（边界线、连线、扫描线）。"""
+    return {"kind": "line", "a": (int(a[0]), int(a[1])),
+            "b": (int(b[0]), int(b[1])), "color": color, "dash": dash}
+
+
+def arrow_guide(a: Pixel, b: Pixel, color: str = GUIDE_MARK) -> dict:
+    """箭头注记（P → P′ 的位移）。"""
+    return {"kind": "arrow", "a": (int(a[0]), int(a[1])),
+            "b": (int(b[0]), int(b[1])), "color": color}
+
+
+def rect_guide(xy: Tuple[int, int, int, int],
+               color: str = "#E5484D") -> dict:
+    """矩形注记（裁剪窗口边框）。xy = (x0, y0, x1, y1)。"""
+    return {"kind": "rect", "xy": tuple(int(v) for v in xy), "color": color}
+
+
+def label_guide(xy: Pixel, text: str, color: str = GUIDE_REF) -> dict:
+    """文字注记（挂在某个像素位置旁边）。"""
+    return {"kind": "label", "xy": (int(xy[0]), int(xy[1])),
+            "text": str(text), "color": color}
+
 
 @dataclass
 class Step:
@@ -45,6 +92,11 @@ class Step:
 
     # 本步的人话解释（监视器副显示行），如 "e2 = -6 ≥ 0 → x 步进"
     note: str = ""
+
+    # 演算注记（窗口边框、交点、轴心、箭头、标签）——只用于显示，
+    # 不进入最终像素，保证"末帧像素 = 几何结果"的双出口一致性。
+    # 放在最后：保持 Step(pixels, values, note) 的既有位置参数调用不变。
+    guides: List[dict] = field(default_factory=list)
 
 
 def expand_steps(steps: List["Step"]) -> List[Pixel]:

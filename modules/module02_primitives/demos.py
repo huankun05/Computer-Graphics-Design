@@ -66,7 +66,9 @@ VAR_BRE     = {"x": "x", "y": "y", "err": "err", "e2": "2·err"}
 VAR_CIRCLE  = {"x": "x", "y": "y", "p": "决策项 p"}
 VAR_ELLIPSE = {"区域": "区域", "x": "x", "y": "y",
                "p1": "决策项 p1", "p2": "决策项 p2"}
-VAR_FILL    = {"y": "扫描线 y", "交点数": "交点数", "填充像素": "本行像素"}
+VAR_FILL    = {"y": "扫描线 y", "交点数": "交点数",
+               "交点x": "交点 x（排序前）", "配对": "排序后配对区间",
+               "填充像素": "本行像素"}
 VAR_COMPARE = {"算法": "算法", "x": "x", "y": "y"}
 
 
@@ -90,6 +92,7 @@ def _merge_two(a_steps, b_steps, a_name, b_name, a_color, b_color):
 
 
 VAR_FILL_ONLY = {"阶段": "阶段", "y": "扫描线 y", "填充像素": "本步像素"}
+VAR_FILL_SCAN = {"阶段": "阶段", **VAR_FILL}
 
 
 def fill_steps_for_shape(shape):
@@ -101,7 +104,7 @@ def fill_steps_for_shape(shape):
     from core.shapes import KIND_ELLIPSE, KIND_POLYGON
     closed = (KIND_CIRCLE, KIND_CIRCLE_MID, KIND_CIRCLE_DDA, KIND_ELLIPSE)
     if isinstance(shape, PolygonShape) and len(shape.vertices) >= 3:
-        return scanline_fill_steps(shape.vertices), VAR_FILL_ONLY
+        return scanline_fill_steps(shape.vertices), VAR_FILL_SCAN
     if hasattr(shape, "r") or hasattr(shape, "rx") or shape.kind in closed:
         outline, _ = rasterize(shape)
         return span_fill_steps(outline), VAR_FILL_ONLY
@@ -497,12 +500,12 @@ class FillDemo(_SpinParams):
     algo = "scanline"       # "scanline" | "seed4" | "seed8"
 
     _VAR = {"scanline": VAR_FILL,
-            "seed4": {"边界": "多边形轮廓像素（DDA 连边）",
-                      "种子": "多边形重心",
-                      "连通": "4 联通：只向上下左右扩散"},
-            "seed8": {"边界": "多边形轮廓像素（DDA 连边）",
-                      "种子": "多边形重心",
-                      "连通": "8 联通：额外含对角方向"}}
+            "seed4": {"波前": "扩散圈数（距种子）",
+                      "新增像素": "本圈新增像素",
+                      "已填充": "累计已填充像素"},
+            "seed8": {"波前": "扩散圈数（距种子）",
+                      "新增像素": "本圈新增像素",
+                      "已填充": "累计已填充像素"}}
     _FORMULA = {
         "scanline": ("扫描线填充（逐行求交配对）\n"
                      "对每条扫描线 y：\n"

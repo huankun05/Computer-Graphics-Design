@@ -27,7 +27,8 @@
 
 from typing import List, Tuple
 
-from algorithms.steps import Step, expand_steps
+from algorithms.steps import (GUIDE_HIT, Step, expand_steps, line_guide,
+                              point_guide)
 
 Pixel = Tuple[int, int]
 
@@ -67,6 +68,8 @@ def scanline_fill_steps(vertices: List[Pixel]) -> List[Step]:
 
     y_min_all = min(e[0] for e in edges)
     y_max_all = max(e[1] for e in edges)
+    min_x = min(v[0] for v in vertices)
+    max_x = max(v[0] for v in vertices)
 
     # ---------- 2. 对每条扫描线求交点并填充（一步 = 一条扫描线） ----------
     step_list: List[Step] = []
@@ -81,18 +84,30 @@ def scanline_fill_steps(vertices: List[Pixel]) -> List[Step]:
         xs.sort()
         # 两两配对填充
         row_pixels: List[Pixel] = []
+        pairs = []
         for i in range(0, len(xs) - 1, 2):
             xa = int(round(xs[i]))
             xb = int(round(xs[i + 1]))
             if xa > xb:
                 xa, xb = xb, xa
+            pairs.append((xa, xb))
             for x in range(xa, xb + 1):
                 row_pixels.append((x, y))
         if row_pixels:
+            # 交点的原始 x（浮点）与排序后的配对区间，全部交给监视器显示
+            x_text = ", ".join(f"{v:.1f}" for v in xs)
+            pair_text = " ".join(f"[{a},{b}]" for a, b in pairs)
+            guides = [line_guide((min_x - 1, y), (max_x + 1, y),
+                                 "#F76B15", dash=False)]
+            guides += [point_guide((int(round(v)), y), f"{v:.1f}", GUIDE_HIT)
+                       for v in xs]
             step_list.append(Step(
                 row_pixels,
-                {"y": y, "交点数": len(xs), "填充像素": len(row_pixels)},
-                f"扫描线 y={y}：{len(xs)} 个交点排序后两两配对，填 {len(row_pixels)} 像素",
+                {"y": y, "交点数": len(xs), "交点x": x_text,
+                 "配对": pair_text, "填充像素": len(row_pixels)},
+                f"扫描线 y={y}：与边求交得 x = {{{x_text}}}，"
+                f"排序后配对 {pair_text}，填 {len(row_pixels)} 像素",
+                guides=guides,
             ))
     return step_list
 

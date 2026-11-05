@@ -28,7 +28,7 @@ class DemoPlayer(QObject):
         super().__init__(parent)
         self.steps = []
         self.index = -1                 # -1 = 尚未开始
-        self.fps = 60                   # 步/秒
+        self.fps = 30                   # 步/秒（默认放慢，单步演算看得清）
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 

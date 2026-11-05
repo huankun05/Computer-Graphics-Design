@@ -19,9 +19,10 @@
 
 from PySide6.QtWidgets import QGridLayout, QLabel, QSpinBox, QVBoxLayout
 
-from algorithms.cohen_sutherland import cohen_sutherland_steps
-from algorithms.liang_barsky import liang_barsky_steps
-from algorithms.sutherland_hodgman import clip_polygon_steps
+from algorithms.cohen_sutherland import cohen_sutherland, cohen_sutherland_steps
+from algorithms.liang_barsky import liang_barsky, liang_barsky_steps
+from algorithms.sutherland_hodgman import (clip_polygon, clip_polygon_steps,
+                                           polygon_outline)
 
 ALGO_COHEN = "cohen_sutherland"
 ALGO_LIANG = "liang_barsky"
@@ -89,6 +90,9 @@ class _ClipDemoBase:
     icon = "fit"
     kind = "canvas"
     freehand_replay = False
+    # 替换式渲染：每帧只显示"当前裁剪结果"，不累积历史线段——
+    # 否则前面步骤留下的整段线会留到最后，末帧不再是算法输出
+    trails = False
     variables = {}
     formula = ""
     algo = ALGO_COHEN
@@ -218,8 +222,28 @@ class _ClipDemoBase:
 # 线段裁剪两页：参数只差算法
 # =====================================================================
 class _LineClipDemo(_ClipDemoBase):
-    variables = {"区域码0": "起点区域码", "区域码1": "终点区域码",
-                 "判定": "本步判定", "端点0": "起点", "端点1": "终点"}
+    # 子类用具体裁剪函数做"被裁部分"参照（与步骤流同源）
+    _clip_fn = None
+
+    def reference_pixels(self):
+        """窗口外的线段像素（橙色参照层）：由裁剪算法结果反推。
+
+        取"原始图元像素 − 各段裁剪结果像素"，而不是拿窗口掩膜做差——
+        参照层与演示步骤流用的是同一个算法，末帧必然对得齐。
+        """
+        from algorithms.line_bresenham import bresenham_line
+        from core.rasterizer import rasterize
+        src = self.playback_source()
+        if src is None or self._clip_fn is None:
+            return []
+        outline, fill = rasterize(src)
+        rect = self._rect(self.collect())
+        kept = set()
+        for a, b in self._segments():
+            res = self._clip_fn(a[0], a[1], b[0], b[1], rect)
+            if res is not None:
+                kept.update(bresenham_line(*res))
+        return sorted((set(outline) | set(fill)) - kept)
 
     def _defs(self):
         return [("wx0", "窗口左", 20, -20, 120), ("wy0", "窗口上", 12, -20, 80),
@@ -253,37 +277,35 @@ class _LineClipDemo(_ClipDemoBase):
         if len(segs) == 1:
             (a, b), = segs
             return self._steps(a[0], a[1], b[0], b[1], rect)
-        # 圆/椭圆/多边形：逐段跑同一裁剪算法，步骤流串联播放
+        # 圆/椭圆/多边形：逐段跑同一裁剪算法，步骤流串联播放。
+        # 替换式渲染下每步像素要带上"前面各段已裁好的结果"，
+        # 否则每段演示完就被下一段覆盖，画面只剩最后一段。
         steps = []
         total = len(segs)
+        committed = set()            # 前 i 段的最终裁剪结果（累计）
         for i, (a, b) in enumerate(segs):
             part = self._steps(a[0], a[1], b[0], b[1], rect)
+            # 只有"接受"的段才进入累计结果；整段舍弃的段演示完应消失
+            tail = part[-1].values if part else {}
+            accepted = tail.get("判定") == "接受" or tail.get("阶段") == "输出"
+            seg_final = set(part[-1].pixels) if (part and accepted) else set()
             for st in part:
+                st.pixels = sorted(set(st.pixels) | committed)
                 st.note = f"第 {i + 1}/{total} 段 · {st.note}"
             steps.extend(part)
+            committed |= seg_final
         return steps
-
-    def reference_pixels(self):
-        """窗口外的线段像素：播放期间以橙色常显，到末帧消失。
-
-        对应"被裁掉的部分"——让用户看到裁剪前线段有多长、哪些被丢弃。
-        """
-        from core.rasterizer import rasterize
-        from algorithms.window_mask import polygon_mask
-        src = self.playback_source()
-        if src is None:
-            return []
-        outline, fill = rasterize(src)
-        rx0, ry0, rx1, ry1 = self._rect(self.collect())
-        mask = polygon_mask([(rx0, ry0), (rx1, ry0),
-                             (rx1, ry1), (rx0, ry1)])
-        return sorted((set(outline) | set(fill)) - set(mask))
 
 
 class CohenDemo(_LineClipDemo):
     title = "编码裁剪（Cohen-Sutherland）"
     icon = "fit"
     algo = ALGO_COHEN
+    variables = {"区域码0": "起点区域码", "区域码1": "终点区域码",
+                 "判定": "本步判定（接受/舍弃/求交）",
+                 "端点0": "当前起点", "端点1": "当前终点",
+                 "交点": "本轮新交点"}
+    default_fps = 2
     formula = ("Cohen-Sutherland 编码裁剪\n"
                "区域码 bit：左1 右2 上4 下8\n"
                "① code0|code1 = 0 → 整段接受\n"
@@ -294,11 +316,19 @@ class CohenDemo(_LineClipDemo):
     def _steps(self, *args):
         return cohen_sutherland_steps(*args)
 
+    _clip_fn = staticmethod(cohen_sutherland)
+
 
 class LiangDemo(_LineClipDemo):
     title = "参数裁剪（Liang-Barsky）"
     icon = "fit"
     algo = ALGO_LIANG
+    variables = {"阶段": "本步阶段（初始/更新/跳过/舍弃/输出）",
+                 "边界": "当前判定的窗口边界",
+                 "p": "参数 p（-dx/dx/-dy/dy）",
+                 "q": "参数 q（起点到边界的有向距离）",
+                 "u0": "下界（进入参数）", "u1": "上界（离开参数）"}
+    default_fps = 2
     formula = ("Liang-Barsky 参数裁剪\n"
                "P(t)=P0+t·(P1-P0), t∈[0,1]\n"
                "对左/右/上/下四条边界：\n"
@@ -309,6 +339,8 @@ class LiangDemo(_LineClipDemo):
     def _steps(self, *args):
         return liang_barsky_steps(*args)
 
+    _clip_fn = staticmethod(liang_barsky)
+
 
 # =====================================================================
 # 多边形裁剪
@@ -318,8 +350,12 @@ class PolygonClipDemo(_ClipDemoBase):
     icon = "polygon"
     algo = ALGO_HODGMAN
     subject_kind = "closed"       # 演示对象 = 画布上选中/最后画的封闭图形
-    variables = {"阶段": "当前裁剪边", "顶点数": "保留顶点数",
-                 "新增交点": "本边新增交点"}
+    default_fps = 2
+    variables = {"阶段": "当前裁剪边",
+                 "输入顶点": "本轮输入顶点数",
+                 "输出顶点": "本轮保留顶点数",
+                 "新增交点": "本边新增交点",
+                 "四情形": "内→内 / 内→外 / 外→内 / 外→外 计数"}
     formula = ("Sutherland-Hodgman 逐边裁剪\n"
                "依次用 左→右→上→下 半平面切分\n"
                "内→外：输出交点；外→内：输出交点\n"
@@ -353,19 +389,17 @@ class PolygonClipDemo(_ClipDemoBase):
         return clip_polygon_steps(verts, rect)
 
     def reference_pixels(self):
-        """窗口外的多边形轮廓像素（橙色参照层，末帧消失）。"""
-        from algorithms.sutherland_hodgman import polygon_outline
-        from algorithms.window_mask import polygon_mask
+        """窗口外的多边形轮廓像素：由 clip_polygon 结果反推（与步骤同源）。"""
         verts = self._vertices()
         if verts is None:
             return []
         p = self.collect()
-        rx0, ry0 = min(p["wx0"], p["wx1"]), min(p["wy0"], p["wy1"])
-        rx1, ry1 = max(p["wx0"], p["wx1"]), max(p["wy0"], p["wy1"])
+        rect = (min(p["wx0"], p["wx1"]), min(p["wy0"], p["wy1"]),
+                max(p["wx0"], p["wx1"]), max(p["wy0"], p["wy1"]))
         full = set(polygon_outline(verts))
-        mask = polygon_mask([(rx0, ry0), (rx1, ry0),
-                             (rx1, ry1), (rx0, ry1)])
-        return sorted(full - set(mask))
+        clipped = clip_polygon(verts, rect)
+        kept = set(polygon_outline(clipped)) if clipped else set()
+        return sorted(full - kept)
 
 
 # =====================================================================

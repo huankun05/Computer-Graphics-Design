@@ -725,8 +725,9 @@ app.processEvents()
 _cp = demo_view._page_host_lay.itemAt(0).widget()
 _cp.hue_bar._handle_pick(QPointF(_cp.hue_bar.width() * 0.5, 10))
 app.processEvents()
-expect("180" in _cp.derive.text(),
-       "色相条拾取 → H 推导联动（180°）")
+expect("180" in _cp.derivation_html()
+       and "180" in demo_view.calc_label.text(),
+       "色相条拾取 → H 推导联动（180°，右侧计算过程卡同步）")
 demo_view._on_page_button(wpages[1], demo_view._page_buttons[wpages[1]])
 app.processEvents()
 _hex_pg = demo_view._page_host_lay.itemAt(0).widget()

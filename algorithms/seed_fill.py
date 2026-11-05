@@ -20,7 +20,7 @@
 
 from typing import Callable, List, Set, Tuple
 
-from algorithms.steps import Step, expand_steps
+from algorithms.steps import (GUIDE_MARK, Step, expand_steps, point_guide)
 
 Point = Tuple[int, int]
 
@@ -128,11 +128,13 @@ def seed_fill_wave_steps(seed: Point, boundary: Set[Point],
     wave = [(sx, sy)]
     steps: List[Step] = []
     d = 0
+    seed_mark = [point_guide(seed, "种子", GUIDE_MARK)]
     while wave:
         steps.append(Step(
             sorted(wave),
-            {"波前": d, "新增": len(wave)},
-            f"第 {d} 圈扩散：新增 {len(wave)} 像素"))
+            {"波前": d, "新增像素": len(wave), "已填充": len(seen)},
+            f"第 {d} 圈扩散：新增 {len(wave)} 像素，累计 {len(seen)}",
+            guides=list(seed_mark)))
         nxt = []
         for (x, y) in wave:
             for dx, dy in nbrs:

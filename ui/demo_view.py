@@ -17,14 +17,14 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QFrame, QSlider, QToolButton, QSpinBox, QLineEdit, QPushButton,
-    QScrollArea, QComboBox,
+    QScrollArea, QComboBox, QCheckBox,
 )
 
 import html as _html
 
 from core.registry import all_modules
 from teaching.player import DemoPlayer
-from teaching.monitor import MonitorPanel
+from teaching.monitor import MonitorPanel, MatrixView
 from ui import theme
 from ui.icons import icon
 
@@ -148,6 +148,7 @@ class DemoView(QWidget):
         self._had_hidden = False
         self._applied_index = -2      # 叠层已应用到的步（-2 = 未应用）
         self._all_pages = []          # [DemoSpec]
+        self._widget_page = None      # 当前装载的无画板交互页（计算过程来源）
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 6)
@@ -277,7 +278,9 @@ class DemoView(QWidget):
     def _build_teaching_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("card")
-        panel.setFixedWidth(290)
+        # 右栏加宽：无画板页的"计算过程"卡要逐行代入公式，
+        # 290px 一行只放得下 8~9 个汉字，演算被折成碎片
+        panel.setFixedWidth(336)
         outer = QVBoxLayout(panel)
         outer.setContentsMargins(0, 0, 0, 0)
         # 教学内容放进滚动容器：卡片保持自然高度，超高时滚动而非互相挤压溢出
@@ -308,11 +311,35 @@ class DemoView(QWidget):
         # 中文为主的公式文本用 UI 字体（Consolas 无中文字形，回退后
         # 笔画瘦、观感差）；行距用富文本 line-height 拉开
         self.formula_label.setTextFormat(Qt.RichText)
+        # 统一用正文字号 + 稍宽行距；不再用绿色（整段长文本用彩色会发飘），
+        # 层次只靠卡片标题区隔
         self.formula_label.setStyleSheet(
             f"font-family: {theme.UI_FONT}; font-size: 13px;"
-            f" color: {theme.SUCCESS};")
+            f" color: {theme.TEXT_1};")
         self.card_formula.body_lay.addWidget(self.formula_label)
+        # 公式卡下方的矩阵图示：仅定义了 formula_matrix 的页（变换四页）
+        # 提供符号矩阵（如 R(θ)），与"决策项监视"里的数值矩阵同一套绘制
+        self.formula_matrix = MatrixView(text_color=theme.TEXT_1, indent=10)
+        self.formula_matrix.setVisible(False)
+        self.card_formula.body_lay.addWidget(self.formula_matrix)
         lay.addWidget(self.card_formula)
+
+        # ---- 计算过程（仅无画板交互页：逐步代入的演算放右侧） ----
+        # 页面内的推导/提示一律搬到这里：右侧才是"演示讲解"区，
+        # 左侧画面只负责图形与参数。正文 13px、步骤名 11px 灰色、
+        # 行距 135%（见 demos._calc_sec），保证每步"公式→代入→结果"
+        # 读得清又不连成文字墙。
+        self.card_calc = CollapsibleCard("计算过程")
+        self.card_calc.setVisible(False)
+        self.calc_label = QLabel("")
+        self.calc_label.setWordWrap(True)
+        self.calc_label.setTextFormat(Qt.RichText)
+        self.calc_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.calc_label.setStyleSheet(
+            f"font-family: {theme.UI_FONT}; font-size: 13px;"
+            f" color: {theme.TEXT_1};")
+        self.card_calc.body_lay.addWidget(self.calc_label)
+        lay.addWidget(self.card_calc)
 
         # ---- 监视器（可折叠） ----
         self.card_monitor = CollapsibleCard("决策项监视")
@@ -391,12 +418,12 @@ class DemoView(QWidget):
         srow.addWidget(slabel)
         self.speed_slider = QSlider(Qt.Horizontal)
         self.speed_slider.setRange(1, 240)
-        self.speed_slider.setValue(60)
+        self.speed_slider.setValue(30)
         self.speed_slider.valueChanged.connect(
             lambda v: (self.player.set_fps(v),
                        self.speed_lab.setText(f"{v} 步/秒")))
         srow.addWidget(self.speed_slider, stretch=1)
-        self.speed_lab = QLabel("60 步/秒")
+        self.speed_lab = QLabel("30 步/秒")
         self.speed_lab.setObjectName("mono")
         srow.addWidget(self.speed_lab)
         play_lay.addLayout(srow)
@@ -445,10 +472,15 @@ class DemoView(QWidget):
         self.card_monitor.setVisible(not is_widget)
         self.card_play.setVisible(not is_widget)
         self.card_concept.setVisible(is_widget)
+        self.card_calc.setVisible(is_widget)
         if is_widget:
-            self.concept_label.setText(_rich_text(
-                "\n".join(f"· {k}：{v}" for k, v in demo.variables.items()),
-                "175%"))
+            # 概念说明 = 三条变量释义 + 页面补充的空间/配色概念
+            lines = [f"· {k}：{v}" for k, v in demo.variables.items()]
+            extra = getattr(demo, "concept", "")
+            if extra:
+                lines.append("")
+                lines.extend(extra.split("\n"))
+            self.concept_label.setText(_rich_text("\n".join(lines), "150%"))
         # 重建参数卡（递归清理：嵌套布局里的控件也要销毁，否则残留重叠）
         self._clear_layout(self.params_lay)
         if not is_widget:
@@ -459,6 +491,8 @@ class DemoView(QWidget):
             # DDA 圆变 8 对称、填充全扫描线、对比页换形状无反应皆源于此。
             # 另：QSpinBox 直连 start 会把滑杆值当毫秒，一并改为定间隔。
             for w in self._param_widgets():
+                if w.objectName() == "noRegen":
+                    continue      # 纯播放选项（按阶段暂停）：勾选不改步骤流
                 if isinstance(w, QSpinBox):
                     w.valueChanged.connect(
                         lambda _v: self._regen_timer.start())
@@ -468,7 +502,14 @@ class DemoView(QWidget):
                 elif isinstance(w, QComboBox):
                     w.currentIndexChanged.connect(
                         lambda _i=0: self._regen_timer.start())
-        self.formula_label.setText(_rich_text(demo.formula))
+                elif isinstance(w, QCheckBox):
+                    w.toggled.connect(
+                        lambda _c=False: self._regen_timer.start())
+        self.formula_label.setText(_rich_text(demo.formula, "150%"))
+        fmat = getattr(demo, "formula_matrix", None)
+        self.formula_matrix.setVisible(fmat is not None)
+        if fmat is not None:
+            self.formula_matrix.set_rows(fmat)
         self.monitor.set_desc(demo.variables)
         # 播放控制：无步骤流概念的无画板页整体禁用（含速度滑杆）
         for b in getattr(self, "_play_btns", []):
@@ -486,7 +527,7 @@ class DemoView(QWidget):
         # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢
         self.canvas.demo.set_accumulate(getattr(demo, "trails", True))
         if hasattr(self, "speed_slider"):
-            self.speed_slider.setValue(int(getattr(demo, "default_fps", 60)))
+            self.speed_slider.setValue(int(getattr(demo, "default_fps", 30)))
         skip = getattr(self, "_skip_next_regen", False)
         self._skip_next_regen = False
         if regenerate and not skip:
@@ -494,13 +535,21 @@ class DemoView(QWidget):
 
     def _mount_widget(self, demo):
         """装载无画板交互页：舞台切到页面容器，画布叠层清干净。"""
+        self._widget_page = None
         while self._page_host_lay.count():
             it = self._page_host_lay.takeAt(0)
             w = it.widget()
             if w is not None:
                 w.setParent(None)    # 立即脱离父级（deleteLater 有延迟）
                 w.deleteLater()
-        self._page_host_lay.addWidget(demo.factory())
+        page = demo.factory()
+        self._page_host_lay.addWidget(page)
+        self._widget_page = page
+        # 页面内任一参数变化 → 右侧"计算过程"卡实时重算
+        sig = getattr(page, "calc_changed", None)
+        if sig is not None:
+            sig.connect(self._refresh_calc)
+        self._refresh_calc()
         self._stage.setCurrentIndex(1)
         self.canvas.demo.reset()
         self._restore_replay_shapes()
@@ -508,6 +557,16 @@ class DemoView(QWidget):
         self._applied_index = -1
         self.monitor.clear()
         self.progress_label.setText("— 交互页（无需播放）")
+
+    def _refresh_calc(self):
+        """把当前交互页的逐步演算贴到右侧"计算过程"卡。"""
+        page = self._widget_page
+        if page is None:
+            return
+        fn = getattr(page, "derivation_html", None)
+        if not callable(fn):
+            return
+        self.calc_label.setText(fn())
 
     @staticmethod
     def _clear_layout(lay):
@@ -611,12 +670,12 @@ class DemoView(QWidget):
         """
         if self._replay_shapes:
             if hasattr(self.current_demo, "subject_kind"):
-                # 裁剪页：播完撤掉演示叠层、恢复原件——播放只做原理演示，
-                # 不动画布；真正的挖除由 Enter 完成（可撤销）
+                # 裁剪页：终帧定格为"裁剪后的结果"，来源图元继续保持隐藏，
+                # 橙色被裁部分清除——末帧必须等于算法输出（双出口一致）。
+                # 真正改动画布仍由 Enter 挖除（可撤销）；换页/重播时恢复原件。
                 self._keep_overlay_at_finish = False
-                self.canvas.demo.reset()
+                self.canvas.demo.solidify()
                 self.canvas.demo.clear_reference()
-                self._restore_replay_shapes()
                 return
             if callable(getattr(self.current_demo, "reference_pixels", None)):
                 # 变换页：终帧定格为实色，并清除橙色初始态参考层——
@@ -777,7 +836,13 @@ class DemoView(QWidget):
             # 填充页已有手绘边界：参数面板只切油漆桶算法，
             # 不生成参数演示步骤（那会清掉用户正在操作的画布）
             return
-        steps = self.current_demo.make_steps(self.current_demo.collect())
+        params = self.current_demo.collect()
+        # 分解/分段演示的图形会离开原位（搬轴心到原点、绕原点转），
+        # 必须跟着重新取景，否则步骤跑出视口
+        if params.get("decompose") or \
+                getattr(self.current_demo, "always_staged", False):
+            fit = True
+        steps = self.current_demo.make_steps(params)
         self.player.pause()
         self.canvas.demo.reset()
         self._applied_index = -1
@@ -793,7 +858,8 @@ class DemoView(QWidget):
             if steps else []
         self.player.load(steps)
         # 公式卡/监视器说明随算法刷新（如直线页 DDA⇄Bresenham 切换）
-        self.formula_label.setText(_rich_text(self.current_demo.formula))
+        self.formula_label.setText(
+            _rich_text(self.current_demo.formula, "150%"))
         self.monitor.set_desc(self.current_demo.variables)
         self.monitor.clear()
         self._update_progress(-1)
@@ -803,8 +869,11 @@ class DemoView(QWidget):
             return
         if fit:
             # 主动选页时才对准生成范围（步骤像素是模拟像素坐标 → ×SIM）
-            xs = [px[0] for s in steps for px in s.pixels]
-            ys = [px[1] for s in steps for px in s.pixels]
+            # 分段变换页的步骤会跑出画布外（轴心先移到原点），橙色初始态
+            # 也要算进来——否则原图可能落在视口外，失去对照。
+            pts = [px for s in steps for px in s.pixels] + list(self._ref_pixels)
+            xs = [px[0] for px in pts]
+            ys = [px[1] for px in pts]
             self.canvas.fit_to_rect(min(xs) * SIM, min(ys) * SIM,
                                     (max(xs) + 1) * SIM, (max(ys) + 1) * SIM)
         if autoplay:
@@ -833,6 +902,24 @@ class DemoView(QWidget):
         self.monitor.update_values(step.values, step.note)
         self._update_progress(index)
         self._sync_reference(index)
+        self._maybe_pause_at_stage(index)
+
+    def _maybe_pause_at_stage(self, index: int):
+        """「按阶段暂停」：当前帧是某阶段最后一帧时自动暂停。
+
+        阶段名取自步骤的 values["阶段"]（下一帧换名即本阶段结束）；
+        只在播放状态生效，手动单步/拖动不受影响。
+        """
+        demo = self.current_demo
+        cb = getattr(demo, "_pause_stage", None)
+        if cb is None or not cb.isChecked() or not self.player.is_playing:
+            return
+        steps = self.player.steps
+        if index < 0 or index + 1 >= len(steps):
+            return
+        if steps[index].values.get("阶段") != \
+                steps[index + 1].values.get("阶段"):
+            self.player.pause()
 
     def _sync_reference(self, index: int):
         """变换演示页：播放/单步期间常显初始态（橙色参照层），

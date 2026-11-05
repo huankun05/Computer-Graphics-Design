@@ -14,8 +14,10 @@
 =====================================================================
 """
 
-from PySide6.QtCore import Qt, QRectF, QTimer
-from PySide6.QtGui import QColor, QPainter
+import math
+
+from PySide6.QtCore import QPointF, Qt, QRectF, QTimer
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 
 from core.shapes import SIM
 
@@ -31,6 +33,7 @@ class PixelLayer:
         self._cur_color = None   # 当前步颜色
         self._cur_inset = 0      # 当前步内缩（对比双层用）
         self._cur = []           # 当前步 QRectF 列表
+        self._guides = []        # 当前步演算注记（窗口/交点/轴心/箭头/标签）
         self._ref = []           # 初始态参考层（变换动画期间常显）
         self._ref_color = None
         self._blink = False      # 闪烁相位
@@ -49,6 +52,7 @@ class PixelLayer:
         self._accumulate = bool(on)
         self._done.clear()
         self._cur = []
+        self._guides = []
         self._ref = []
         self._ref_color = None
         self._timer.stop()
@@ -80,6 +84,7 @@ class PixelLayer:
         self._timer.stop()
         self._done.clear()
         self._cur = []
+        self._guides = []
         self._cur_color = None
         self._ref = []
         self._ref_color = None
@@ -117,6 +122,8 @@ class PixelLayer:
         else:
             self._done.clear()
         self._cur_color = color
+        # 演算注记只跟随当前步：窗口边框/交点/轴心每步重画，不累积
+        self._guides = list(getattr(step, "guides", None) or [])
         self._cur_inset = int(step.values.get("inset", 0)
                               if isinstance(step.values, dict) else 0)
         i = self._cur_inset
@@ -157,6 +164,84 @@ class PixelLayer:
             painter.setPen(Qt.NoPen)
             painter.setBrush(c)
             painter.drawRects(self._cur)
+        # 演算注记画在像素之上：窗口边框/交点/轴心/箭头/标签
+        self._draw_guides(painter)
+
+    # ------------------------------------------------------------------
+    # 演算注记渲染（Step.guides 的纯 dict 描述 → 图元）
+    # ------------------------------------------------------------------
+    def _draw_guides(self, painter: QPainter):
+        if not self._guides:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = QFont(painter.font())
+        # 显式给字体族：注记含中文，painter 继承的字体可能缺字形（显示方块）
+        font.setFamilies(["Microsoft YaHei UI", "Microsoft YaHei",
+                          "Segoe UI", "Sans Serif"])
+        font.setPixelSize(max(10, int(SIM * 0.7)))
+        font.setBold(True)
+        point_r = max(4.0, SIM * 0.22)
+        for g in self._guides:
+            color = QColor(g.get("color") or "#3E63DD")
+            kind = g.get("kind")
+            if kind == "rect":
+                x0, y0, x1, y1 = g["xy"]
+                painter.setPen(QPen(color, 1.6, Qt.DashLine))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(QRectF(x0 * SIM, y0 * SIM,
+                                        (x1 - x0 + 1) * SIM,
+                                        (y1 - y0 + 1) * SIM))
+            elif kind in ("line", "arrow"):
+                a, b = g["a"], g["b"]
+                painter.setPen(QPen(color, 1.6,
+                                    Qt.DashLine if g.get("dash")
+                                    else Qt.SolidLine))
+                p1 = QPointF(a[0] * SIM + SIM / 2, a[1] * SIM + SIM / 2)
+                p2 = QPointF(b[0] * SIM + SIM / 2, b[1] * SIM + SIM / 2)
+                painter.drawLine(p1, p2)
+                if kind == "arrow":
+                    self._draw_arrow_head(painter, p1, p2, color, point_r)
+            elif kind == "point":
+                x, y = g["xy"]
+                cx = x * SIM + SIM / 2
+                cy = y * SIM + SIM / 2
+                painter.setPen(QPen(color, 1))
+                painter.setBrush(QBrush(color))
+                painter.drawEllipse(QPointF(cx, cy), point_r, point_r)
+                text = g.get("label") or ""
+                if text:
+                    painter.setFont(font)
+                    painter.setPen(QPen(color))
+                    painter.drawText(QPointF(cx + point_r + 3,
+                                             cy - point_r), text)
+            elif kind == "label":
+                x, y = g["xy"]
+                text = g.get("text") or ""
+                if text:
+                    painter.setFont(font)
+                    painter.setPen(QPen(color))
+                    painter.drawText(QPointF(x * SIM + SIM / 2 + 3,
+                                             y * SIM - 2), text)
+        painter.restore()
+
+    @staticmethod
+    def _draw_arrow_head(painter, p1: QPointF, p2: QPointF,
+                         color: QColor, size: float):
+        """箭头：在 p2 端画两段短线（方向 = p1→p2）。"""
+        dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return
+        ux, uy = dx / length, dy / length
+        head = max(6.0, size * 1.8)
+        left = QPointF(p2.x() - ux * head - uy * head / 2,
+                       p2.y() - uy * head + ux * head / 2)
+        right = QPointF(p2.x() - ux * head + uy * head / 2,
+                        p2.y() - uy * head - ux * head / 2)
+        painter.setPen(QPen(color, 1.6))
+        painter.drawLine(p2, left)
+        painter.drawLine(p2, right)
 
     def _toggle_blink(self):
         self._blink = not self._blink
