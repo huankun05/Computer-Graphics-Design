@@ -21,7 +21,8 @@ cohen_sutherland_steps() 的末步像素与几何结果逐像素一致。
 from typing import List, Optional, Tuple
 
 from algorithms.line_bresenham import bresenham_line
-from algorithms.steps import (GUIDE_HIT, Step, point_guide, rect_guide)
+from algorithms.steps import (GUIDE_HIT, GUIDE_MARK, Step, point_guide,
+                              rect_guide)
 
 LEFT, RIGHT, TOP, BOTTOM = 1, 2, 4, 8
 
@@ -45,9 +46,12 @@ def region_code(x: float, y: float, rect: Rect) -> int:
 
 
 def code_text(code: int) -> str:
-    """区域码 → "左/右/上/下" 可读文本（监视器用）。"""
+    """区域码 → "二进制 + 所在区域" 可读文本（监视器用）。
+
+    4 位顺序 D3 D2 D1 D0 = 下 上 右 左，例如 0100 表示在窗口上方。
+    """
     if code == 0:
-        return "0000 窗口内"
+        return "0000 内"
     parts = []
     for bit, name in ((LEFT, "左"), (RIGHT, "右"),
                       (TOP, "上"), (BOTTOM, "下")):
@@ -138,31 +142,35 @@ def cohen_sutherland_steps(x0: int, y0: int, x1: int, y1: int,
         p1 = (int(round(fx1)), int(round(fy1)))
         seg = bresenham_line(p0[0], p0[1], p1[0], p1[1])
         values = {"区域码0": code_text(c0), "区域码1": code_text(c1),
-                  "判定": "检测", "端点0": p0, "端点1": p1, "交点": "—"}
+                  "与 / 或": f"{c0 & c1:04b} / {c0 | c1:04b}",
+                  "端点0": p0, "端点1": p1, "交点": "—"}
+        # 两端点直接标出二进制码，画面上就能对上监视器
+        marks = [point_guide(p0, f"{c0:04b}", GUIDE_MARK),
+                 point_guide(p1, f"{c1:04b}", GUIDE_MARK)]
         if not (c0 | c1):
             steps.append(Step(sorted(set(seg)),
                               {**values, "判定": "接受"},
-                              "code0|code1 = 0000|0000 = 0 → 整段接受",
-                              guides=[frame]))
+                              "或 = 0000 → 整段接受",
+                              guides=[frame, *marks]))
             return steps
         if c0 & c1:
             steps.append(Step(sorted(set(seg)),
                               {**values, "判定": "舍弃"},
-                              f"code0&code1 = {c0 & c1:04b} ≠ 0 → 两端同侧，舍弃",
-                              guides=[frame]))
+                              f"与 = {c0 & c1:04b} ≠ 0000 → 同侧，舍弃",
+                              guides=[frame, *marks]))
             return steps
         code = c0 if c0 else c1
-        side = ("上边界 y=窗口上" if code & TOP
-                else "下边界 y=窗口下" if code & BOTTOM
-                else "右边界 x=窗口右" if code & RIGHT else "左边界 x=窗口左")
+        side = ("上边界" if code & TOP
+                else "下边界" if code & BOTTOM
+                else "右边界" if code & RIGHT else "左边界")
         px, py = _intersect(fx0, fy0, fx1, fy1, code, rect)
         hit = (int(round(px)), int(round(py)))
         steps.append(Step(
             sorted(set(seg)),
             {**values, "判定": "求交", "交点": hit},
-            f"code0&code1 = 0 且 code0|code1 ≠ 0 → 取外端点按{side}求交，"
-            f"截到 ({px:.1f}, {py:.1f})",
-            guides=[frame, point_guide(hit, "交点", GUIDE_HIT)]))
+            f"与 = 0000、或 ≠ 0000 → 按{side}求交 → "
+            f"({px:.1f}, {py:.1f})",
+            guides=[frame, *marks, point_guide(hit, "交点", GUIDE_HIT)]))
         if code == c0:
             fx0, fy0 = px, py
         else:

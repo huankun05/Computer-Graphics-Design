@@ -129,15 +129,16 @@ def clip_polygon_steps(points: Sequence[Tuple[int, int]],
     steps.append(Step(sorted(set(polygon_outline(start))),
                       {"阶段": "初始", "输入顶点": len(start),
                        "输出顶点": len(start), "新增交点": 0,
-                       "四情形": "待裁剪"},
+                       "内→内": 0, "内→外": 0, "外→内": 0, "外→外": 0},
                       f"待裁剪多边形：{len(start)} 个顶点",
                       guides=[frame, *_vertex_guides(start)]))
     for edge in ("left", "right", "top", "bottom"):
         if not out:
             steps.append(Step([], {"阶段": _EDGE_CN[edge], "输入顶点": 0,
                                    "输出顶点": 0, "新增交点": 0,
-                                   "四情形": "多边形已空"},
-                              f"{_EDGE_CN[edge]}：多边形已空，无顶点可裁",
+                                   "内→内": 0, "内→外": 0,
+                                   "外→内": 0, "外→外": 0},
+                              f"{_EDGE_CN[edge]}：多边形已空，停止",
                               guides=[frame, _edge_guide(edge, rect)]))
             break
         src = out
@@ -163,14 +164,14 @@ def clip_polygon_steps(points: Sequence[Tuple[int, int]],
                 hits.append((int(round(p[0])), int(round(p[1]))))
                 added += 1
         cur = [(int(round(x)), int(round(y))) for x, y in out]
-        case_text = " ".join(f"{k}{v}" for k, v in cases.items())
         steps.append(Step(
             sorted(set(polygon_outline(cur))),
             {"阶段": _EDGE_CN[edge], "输入顶点": len(src),
              "输出顶点": len(cur), "新增交点": added,
-             "四情形": case_text},
-            f"{_EDGE_CN[edge]}：{len(src)} 个顶点逐边判定"
-            f"（{case_text}）→ 保留 {len(cur)} 个，新增 {added} 个交点",
+             "内→内": cases["内→内"], "内→外": cases["内→外"],
+             "外→内": cases["外→内"], "外→外": cases["外→外"]},
+            f"{_EDGE_CN[edge]}：{len(src)} → {len(cur)} 顶点，"
+            f"新增 {added} 个交点",
             guides=[frame, _edge_guide(edge, rect),
                     *_vertex_guides(cur),
                     *[point_guide(h, "交点", GUIDE_HIT) for h in hits]]))

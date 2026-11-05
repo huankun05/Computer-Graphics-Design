@@ -83,7 +83,7 @@ def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
     dx, dy = float(x1 - x0), float(y1 - y0)
     p = (-dx, dx, -dy, dy)
     q = (x0 - rx0, rx1 - x0, y0 - ry0, ry1 - y0)
-    names = ("左边界 x=rx0", "右边界 x=rx1", "上边界 y=ry0", "下边界 y=ry1")
+    names = ("左边界", "右边界", "上边界", "下边界")
     u0, u1 = 0.0, 1.0
     steps: List[Step] = []
 
@@ -103,8 +103,8 @@ def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
 
     def _vals(stage, name, pi, qi, cur0, cur1):
         return {"阶段": stage, "边界": name,
-                "p": "—" if pi is None else f"{pi:.1f}",
-                "q": "—" if qi is None else f"{qi:.1f}",
+                "p": "—" if pi is None else f"{pi:.0f}",
+                "q": "—" if qi is None else f"{qi:.0f}",
                 "u0": f"{cur0:.3f}", "u1": f"{cur1:.3f}"}
 
     steps.append(Step(sorted(set(_seg_at(u0, u1))),
@@ -117,31 +117,31 @@ def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
             if qi < 0:
                 steps.append(Step(sorted(set(_seg_at(u0, u1))),
                                   _vals("舍弃", names[i], 0.0, qi, u0, u1),
-                                  f"{names[i]}：p=0 且 q={qi:.1f}<0 → "
-                                  f"平行且在窗口外，整段舍弃",
+                                  f"{names[i]}：p=0、q<0 → 平行在外，舍弃",
                                   guides=base))
                 return steps
             steps.append(Step(sorted(set(_seg_at(u0, u1))),
                               _vals("跳过", names[i], 0.0, qi, u0, u1),
-                              f"{names[i]}：p=0 且 q={qi:.1f}≥0 → "
-                              f"平行于边界，u0/u1 不变",
+                              f"{names[i]}：p=0、q≥0 → 平行，跳过",
                               guides=base))
             continue
         t = qi / pi
         if pi < 0:
+            old = u0
             u0 = max(u0, t)
-            act = f"p={pi:.1f}<0（进入边）：u0 = max(u0, q/p={t:.3f}) = {u0:.3f}"
+            act = f"p={pi:.0f}<0 → u0 = max({old:.3f}, {t:.3f}) = {u0:.3f}"
         else:
+            old = u1
             u1 = min(u1, t)
-            act = f"p={pi:.1f}>0（离开边）：u1 = min(u1, q/p={t:.3f}) = {u1:.3f}"
+            act = f"p={pi:.0f}>0 → u1 = min({old:.3f}, {t:.3f}) = {u1:.3f}"
         if u0 > u1:
             steps.append(Step(sorted(set(_seg_at(u0, u1))),
                               _vals("舍弃", names[i], pi, qi, u0, u1),
-                              f"{names[i]}：{act} → u0>u1，整段舍弃",
+                              f"{names[i]}：{act} → u0>u1，舍弃",
                               guides=[frame, edges[i], *_marks(u0, u1)]))
             return steps
         steps.append(Step(sorted(set(_seg_at(u0, u1))),
-                          _vals("更新", names[i], pi, qi, u0, u1),
+                          _vals("收窄", names[i], pi, qi, u0, u1),
                           f"{names[i]}：{act}",
                           guides=[frame, edges[i], *_marks(u0, u1)]))
     steps.append(Step(sorted(set(_seg_at(u0, u1))),

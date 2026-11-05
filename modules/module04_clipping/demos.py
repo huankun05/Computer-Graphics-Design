@@ -301,17 +301,20 @@ class CohenDemo(_LineClipDemo):
     title = "编码裁剪（Cohen-Sutherland）"
     icon = "fit"
     algo = ALGO_COHEN
-    variables = {"区域码0": "起点区域码", "区域码1": "终点区域码",
-                 "判定": "本步判定（接受/舍弃/求交）",
-                 "端点0": "当前起点", "端点1": "当前终点",
-                 "交点": "本轮新交点"}
+    variables = {"区域码0": "起点码", "区域码1": "终点码",
+                 "与 / 或": "与 / 或",
+                 "判定": "判定", "端点0": "起点", "端点1": "终点",
+                 "交点": "新交点"}
     default_fps = 2
     formula = ("Cohen-Sutherland 编码裁剪\n"
-               "区域码 bit：左1 右2 上4 下8\n"
-               "① code0|code1 = 0 → 整段接受\n"
-               "② code0&code1 ≠ 0 → 整段舍弃\n"
-               "③ 否则取外端点按所在边界求交\n"
-               "每轮至少一位区域码被清零，最多 4 轮")
+               "区域码 4 位 D3 D2 D1 D0\n"
+               "  D3 下 1000    D2 上 0100\n"
+               "  D1 右 0010    D0 左 0001\n"
+               "与 = code0 & code1，或 = code0 | code1\n"
+               "① 或 = 0000 → 接受\n"
+               "② 与 ≠ 0000 → 舍弃\n"
+               "③ 否则取外端点求交，清 1 位重判\n"
+               "每轮至少清 1 位，最多 4 轮")
 
     def _steps(self, *args):
         return cohen_sutherland_steps(*args)
@@ -323,18 +326,18 @@ class LiangDemo(_LineClipDemo):
     title = "参数裁剪（Liang-Barsky）"
     icon = "fit"
     algo = ALGO_LIANG
-    variables = {"阶段": "本步阶段（初始/更新/跳过/舍弃/输出）",
-                 "边界": "当前判定的窗口边界",
-                 "p": "参数 p（-dx/dx/-dy/dy）",
-                 "q": "参数 q（起点到边界的有向距离）",
-                 "u0": "下界（进入参数）", "u1": "上界（离开参数）"}
+    variables = {"阶段": "阶段", "边界": "当前边界",
+                 "p": "p", "q": "q", "u0": "u0", "u1": "u1"}
     default_fps = 2
     formula = ("Liang-Barsky 参数裁剪\n"
-               "P(t)=P0+t·(P1-P0), t∈[0,1]\n"
-               "对左/右/上/下四条边界：\n"
-               "p·t ≤ q，p<0 进边、p>0 出边\n"
-               "u0 = max(u0, q/p)，u1 = min(u1, q/p)\n"
-               "u0 > u1 → 整段舍弃")
+               "P(t) = P0 + t·d，t ∈ [0, 1]\n"
+               "四条边界依次判 p·t ≤ q：\n"
+               "  p = -dx, dx, -dy, dy\n"
+               "  q = x0-rx0, rx1-x0, y0-ry0, ry1-y0\n"
+               "p < 0 → u0 = max(u0, q/p)\n"
+               "p > 0 → u1 = min(u1, q/p)\n"
+               "p = 0 且 q < 0 → 平行在外，舍弃\n"
+               "u0 > u1 → 舍弃")
 
     def _steps(self, *args):
         return liang_barsky_steps(*args)
@@ -351,16 +354,17 @@ class PolygonClipDemo(_ClipDemoBase):
     algo = ALGO_HODGMAN
     subject_kind = "closed"       # 演示对象 = 画布上选中/最后画的封闭图形
     default_fps = 2
-    variables = {"阶段": "当前裁剪边",
-                 "输入顶点": "本轮输入顶点数",
-                 "输出顶点": "本轮保留顶点数",
-                 "新增交点": "本边新增交点",
-                 "四情形": "内→内 / 内→外 / 外→内 / 外→外 计数"}
+    variables = {"阶段": "当前边", "输入顶点": "输入", "输出顶点": "输出",
+                 "新增交点": "新交点", "内→内": "内→内", "内→外": "内→外",
+                 "外→内": "外→内", "外→外": "外→外"}
     formula = ("Sutherland-Hodgman 逐边裁剪\n"
-               "依次用 左→右→上→下 半平面切分\n"
-               "内→外：输出交点；外→内：输出交点\n"
-               "凹多边形可能拆成多个区域\n"
-               "四轮后得到窗口内多边形")
+               "左 → 右 → 上 → 下，逐条半平面切分\n"
+               "对每条边遍历 S→E：\n"
+               "  E 内 S 内 → 留 E\n"
+               "  E 内 S 外 → 交点 + E\n"
+               "  E 外 S 内 → 交点\n"
+               "  E 外 S 外 → 无\n"
+               "四轮后即窗口内多边形")
 
     def _defs(self):
         return [("wx0", "窗口左", 16, -20, 120), ("wy0", "窗口上", 12, -20, 80),
