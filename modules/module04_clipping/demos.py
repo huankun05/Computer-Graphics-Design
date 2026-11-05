@@ -19,7 +19,8 @@
 
 from PySide6.QtWidgets import QGridLayout, QLabel, QSpinBox, QVBoxLayout
 
-from algorithms.cohen_sutherland import cohen_sutherland, cohen_sutherland_steps
+from algorithms.cohen_sutherland import (cohen_sutherland,
+                                         cohen_sutherland_steps, region_code)
 from algorithms.liang_barsky import liang_barsky, liang_barsky_steps
 from algorithms.sutherland_hodgman import (clip_polygon, clip_polygon_steps,
                                            polygon_outline)
@@ -29,6 +30,10 @@ ALGO_LIANG = "liang_barsky"
 ALGO_HODGMAN = "sutherland_hodgman"
 
 TESS_SEGMENTS = 32          # 圆/椭圆 → 折线的离散段数
+
+# Cohen 的 9 个区域：窗口内 + 四边 + 四角（键 = 4 位区域码的十进制值）
+REGION_CN = {0: "窗口内", 1: "左", 2: "右", 4: "上", 8: "下",
+             5: "左上", 6: "右上", 9: "左下", 10: "右下"}
 
 
 def _ellipse_polygon(cx, cy, rx, ry, angle, n=TESS_SEGMENTS):
@@ -90,6 +95,7 @@ class _ClipDemoBase:
     icon = "fit"
     kind = "canvas"
     freehand_replay = False
+    supports_hover = False      # True = 鼠标悬停时显示分区标签（Cohen 页）
     # 替换式渲染：每帧只显示"当前裁剪结果"，不累积历史线段——
     # 否则前面步骤留下的整段线会留到最后，末帧不再是算法输出
     trails = False
@@ -320,6 +326,61 @@ class CohenDemo(_LineClipDemo):
         return cohen_sutherland_steps(*args)
 
     _clip_fn = staticmethod(cohen_sutherland)
+
+    # ---- 鼠标悬停：窗口四边延长 → 9 个区域各标一个二进制码 ----
+    supports_hover = True
+
+    def hover_guides(self, x, y, canvas):
+        """按当前窗口把可见画布划成 9 个区域，每区标出 4 位区域码。
+
+        悬停所在区域高亮；码序与监视器一致（D3 D2 D1 D0 = 下 上 右 左）。
+        """
+        from core.shapes import SIM
+        rect = self._rect(self.collect())
+        rx0, ry0, rx1, ry1 = rect
+        sr = canvas.mapToScene(canvas.viewport().rect()).boundingRect()
+        bx0, by0 = sr.left() / SIM, sr.top() / SIM
+        bx1, by1 = sr.right() / SIM, sr.bottom() / SIM
+        # 窗口必须完整落在分区里，四边至少留 3 格放标签
+        bx0 = min(bx0, rx0 - 3)
+        bx1 = max(bx1, rx1 + 3)
+        by0 = min(by0, ry0 - 3)
+        by1 = max(by1, ry1 + 3)
+        xs = (bx0, rx0, rx1, bx1)
+        ys = (by0, ry0, ry1, by1)
+        hot = region_code(x, y, rect)
+        out = [
+            # 窗口四条边向外延长 → 把平面分成 9 个区域
+            {"kind": "line", "xy": ((rx0, by0), (rx0, by1))},
+            {"kind": "line", "xy": ((rx1, by0), (rx1, by1))},
+            {"kind": "line", "xy": ((bx0, ry0), (bx1, ry0))},
+            {"kind": "line", "xy": ((bx0, ry1), (bx1, ry1))},
+        ]
+        for j in range(3):
+            for i in range(3):
+                cx = 0.5 * (xs[i] + xs[i + 1])
+                cy = 0.5 * (ys[j] + ys[j + 1])
+                code = region_code(cx, cy, rect)
+                on = code == hot
+                text = f"{code:04b} {REGION_CN.get(code, '')}".strip()
+                # 窄条区域自动缩字号，避免文字超出分区
+                w = (xs[i + 1] - xs[i]) * SIM
+                h = (ys[j + 1] - ys[j]) * SIM
+                size = max(10, int(min(SIM * 0.68, h * 0.5,
+                                      w / (max(1, len(text)) * 0.72))))
+                out.append({
+                    "kind": "zone",
+                    "xy": (xs[i], ys[j], xs[i + 1], ys[j + 1]),
+                    "text": text,
+                    "size": size,
+                    "border": on,
+                    "color": "#4F6EF7",
+                    "fill": "#4F6EF7" if on else None,
+                    "fill_alpha": 24,
+                    "text_color": "#2B4BD6" if on else "#8A919F",
+                    "bold": on,
+                })
+        return out
 
 
 class LiangDemo(_LineClipDemo):

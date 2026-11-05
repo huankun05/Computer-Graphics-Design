@@ -16,7 +16,7 @@
 
 import math
 
-from PySide6.QtCore import QPointF, Qt, QRectF, QTimer
+from PySide6.QtCore import QPointF, Qt, QRectF, QTimer, QLineF
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 
 from core.shapes import SIM
@@ -34,6 +34,7 @@ class PixelLayer:
         self._cur_inset = 0      # 当前步内缩（对比双层用）
         self._cur = []           # 当前步 QRectF 列表
         self._guides = []        # 当前步演算注记（窗口/交点/轴心/箭头/标签）
+        self._hover = []         # 鼠标悬停层（区域码分区等，独立于步骤流）
         self._ref = []           # 初始态参考层（变换动画期间常显）
         self._ref_color = None
         self._blink = False      # 闪烁相位
@@ -53,6 +54,7 @@ class PixelLayer:
         self._done.clear()
         self._cur = []
         self._guides = []
+        self._hover = []
         self._ref = []
         self._ref_color = None
         self._timer.stop()
@@ -79,12 +81,31 @@ class PixelLayer:
         self._ref_color = None
         self._cv.viewport().update()
 
+    def set_hover(self, guides):
+        """设置鼠标悬停注记层（区域码分区等，不随步骤流变化）。
+
+        内容与上次相同就不重绘：鼠标在同一区域内移动时不反复刷画布。
+        """
+        guides = list(guides or [])
+        if guides == self._hover:
+            return
+        self._hover = guides
+        self._cv.viewport().update()
+
+    def clear_hover(self):
+        """清除悬停注记层（鼠标离开画布 / 换页时）。"""
+        if not self._hover:
+            return
+        self._hover = []
+        self._cv.viewport().update()
+
     def reset(self):
         """清空整层（载入新算法 / 回退 / 重放时）。"""
         self._timer.stop()
         self._done.clear()
         self._cur = []
         self._guides = []
+        self._hover = []
         self._cur_color = None
         self._ref = []
         self._ref_color = None
@@ -166,6 +187,57 @@ class PixelLayer:
             painter.drawRects(self._cur)
         # 演算注记画在像素之上：窗口边框/交点/轴心/箭头/标签
         self._draw_guides(painter)
+        # 鼠标悬停层（区域码分区）画在最上
+        self._draw_hover(painter)
+
+    # ------------------------------------------------------------------
+    def _draw_hover(self, painter: QPainter):
+        """悬停注记：zone = 分区（可填色/描边），line = 分区延长线。"""
+        if not self._hover:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = QFont(painter.font())
+        font.setFamilies(["Microsoft YaHei UI", "Microsoft YaHei",
+                          "Segoe UI", "Sans Serif"])
+        for g in self._hover:
+            kind = g.get("kind")
+            if kind == "line":
+                (x0, y0), (x1, y1) = g["xy"]
+                painter.setPen(QPen(QColor(g.get("color") or "#B8C2D6"),
+                                    1.0, Qt.DashLine))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawLine(QLineF(x0 * SIM, y0 * SIM,
+                                        x1 * SIM, y1 * SIM))
+                continue
+            if kind != "zone":
+                continue
+            x0, y0, x1, y1 = g["xy"]
+            box = QRectF(x0 * SIM, y0 * SIM,
+                         (x1 - x0) * SIM, (y1 - y0) * SIM)
+            fill = g.get("fill")
+            if fill:
+                c = QColor(fill)
+                c.setAlpha(int(g.get("fill_alpha", 24)))
+                painter.setBrush(c)
+            else:
+                painter.setBrush(Qt.NoBrush)
+            if g.get("border"):
+                painter.setPen(QPen(QColor(g.get("color") or "#E1E5F0"), 1.2,
+                                    Qt.SolidLine))
+                painter.drawRect(box)
+            elif fill:
+                painter.setPen(Qt.NoPen)
+                painter.drawRect(box)
+            text = g.get("text") or ""
+            if not text:
+                continue
+            font.setPixelSize(int(g.get("size") or max(11, int(SIM * 0.68))))
+            font.setBold(bool(g.get("bold")))
+            painter.setFont(font)
+            painter.setPen(QPen(QColor(g.get("text_color") or "#8A919F")))
+            painter.drawText(box, Qt.AlignCenter, text)
+        painter.restore()
 
     # ------------------------------------------------------------------
     # 演算注记渲染（Step.guides 的纯 dict 描述 → 图元）

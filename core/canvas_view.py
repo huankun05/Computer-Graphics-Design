@@ -148,6 +148,9 @@ class CanvasView(QGraphicsView):
         self._ghost_pixels = []              # 幽灵像素（移动预览）
         self._ghost_color = SELECT_COLOR
         self._move_ctx = None                # 移动上下文 {shape,start,snap,last}
+        # 演示页悬停注记：callable(x, y) -> guides（区域码分区等），无则 None
+        self.hover_guide_fn = None
+        self._hover_pos = None               # 最近一次鼠标位置（模拟像素）
 
         # ---- 算法下拉 / 填充切换（选项条驱动的全局绘图态） ----
         self.algorithm = "line_dda"     # 当前算法键（形状→算法清单在 tools/ 声明）
@@ -1305,6 +1308,19 @@ class CanvasView(QGraphicsView):
     # ==================================================================
     # 鼠标事件：平移 / 交给工具
     # ==================================================================
+    def leaveEvent(self, event):
+        """鼠标离开画布：清掉悬停注记（区域码分区），不残留。"""
+        self.demo.clear_hover()
+        super().leaveEvent(event)
+
+    def refresh_hover(self):
+        """按当前鼠标位置重算悬停注记（参数改动后也调用，避免分区画面过期）。"""
+        if self.hover_guide_fn is None or self._hover_pos is None:
+            return
+        if not self.underMouse():
+            return
+        self.demo.set_hover(self.hover_guide_fn(*self._hover_pos))
+
     def mousePressEvent(self, event: QMouseEvent):
         # 空格+左键 或 中键：进入平移（PS 风格抓手）
         if event.button() == Qt.MiddleButton or \
@@ -1376,6 +1392,8 @@ class CanvasView(QGraphicsView):
             return
         pos = self._to_pos(event)
         self.cursor_changed.emit(int(pos.x()), int(pos.y()))
+        self._hover_pos = (pos.x(), pos.y())
+        self.refresh_hover()
         if self._move_ctx:
             # 变换预览用未量化浮点模拟坐标：缩放比例连续平滑，
             # 移动增量在 update_move 内部 int() 取整到所在格

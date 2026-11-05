@@ -455,6 +455,7 @@ class DemoView(QWidget):
         """
         if self.current_demo is None:
             self.on_shown(autoplay=False)
+        self.canvas.demo.clear_hover()   # 上次离开时可能残留悬停分区
 
     def _load_page(self, demo, regenerate=False, autoplay=True):
         """切换演示页：重建参数卡 + 公式/监视器。
@@ -522,6 +523,11 @@ class DemoView(QWidget):
         # 画布页：舞台切回画布；页面即工具（自由画布拾取的入口）
         self._stage.setCurrentIndex(0)
         self._sync_tool(demo)
+        # 悬停注记：仅声明 supports_hover 的页（裁剪页的区域码分区）启用
+        self.canvas.demo.clear_hover()
+        self.canvas.hover_guide_fn = (
+            demo.hover_guides if getattr(demo, "supports_hover", False)
+            else None)
 
         self._restore_replay_shapes()  # 切页前恢复上一轮回放的图元显示
         # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢
@@ -863,6 +869,7 @@ class DemoView(QWidget):
         self.monitor.set_desc(self.current_demo.variables)
         self.monitor.clear()
         self._update_progress(-1)
+        self.canvas.refresh_hover()   # 窗口参数变了 → 悬停分区跟着重算
         if not steps:
             self.progress_label.setText(
                 getattr(self.current_demo, "empty_hint", "") or "无输出（检查参数）")
