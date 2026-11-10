@@ -44,6 +44,7 @@ Pixel = Tuple[int, int]
 GUIDE_REF = "#8A94A6"      # 辅助/轴心（灰）
 GUIDE_MARK = "#F76B15"     # 源状态/待观察（橙）
 GUIDE_HIT = "#3E63DD"      # 算法产出/交点（蓝）
+GUIDE_MOVE = "#7C3AED"     # 线段/图形自身的变化（紫）：端点移动、当前处理的边
 
 
 def point_guide(xy: Pixel, label: str = "", color: str = GUIDE_HIT) -> dict:
@@ -53,10 +54,38 @@ def point_guide(xy: Pixel, label: str = "", color: str = GUIDE_HIT) -> dict:
 
 
 def line_guide(a: Pixel, b: Pixel, color: str = GUIDE_REF,
-               dash: bool = True) -> dict:
-    """线注记（边界线、连线、扫描线）。"""
+               dash: bool = True, width: float = 1.6) -> dict:
+    """线注记（边界线、连线、扫描线）。width 可加粗用于"当前处理的那条边"。"""
     return {"kind": "line", "a": (int(a[0]), int(a[1])),
-            "b": (int(b[0]), int(b[1])), "color": color, "dash": dash}
+            "b": (int(b[0]), int(b[1])), "color": color, "dash": dash,
+            "width": float(width)}
+
+
+def boundary_guide(a: Pixel, b: Pixel, color: str = GUIDE_REF,
+                   dash: bool = True, width: float = 1.6) -> dict:
+    """窗口边界线注记——坐标按【格子边缘】解释，而不是格心。
+
+    与 line_guide 的区别：line_guide 穿过格心（扫描线、连线用它对），
+    而裁剪的边界必须压在格子的边上。窗口是闭区间 x0..x1，连续外沿
+    恰是 x0 与 x1+1——画在格心上会和红色窗口框差半格（用户反馈：
+    "边界显示有问题"）。
+    """
+    return {"kind": "boundary", "a": (int(a[0]), int(a[1])),
+            "b": (int(b[0]), int(b[1])), "color": color, "dash": dash,
+            "width": float(width)}
+
+
+def edge_guide(rect: Tuple[int, int, int, int], side: str,
+               color: str = GUIDE_MARK, label: str = "") -> dict:
+    """当前正在使用的那条窗口边（整条高亮，画在红框外侧 2px）。
+
+    裁剪演示的关键是"这一轮用的哪条边"：只画窗口外的延长段太短，
+    看不清；整条压在红框上又会把红框染色（用户反馈）。折中方案 =
+    沿这条边、在红框外侧偏移 2px 画一条更粗的实线，红框始终完整。
+    side ∈ left / right / top / bottom。
+    """
+    return {"kind": "edge", "rect": tuple(int(v) for v in rect),
+            "side": side, "color": color, "label": label}
 
 
 def arrow_guide(a: Pixel, b: Pixel, color: str = GUIDE_MARK) -> dict:
@@ -65,16 +94,60 @@ def arrow_guide(a: Pixel, b: Pixel, color: str = GUIDE_MARK) -> dict:
             "b": (int(b[0]), int(b[1])), "color": color}
 
 
+def border_extension_segments(rect: Tuple[int, int, int, int], ext: int = 5):
+    """窗口四条边 → 只画在窗口【外侧】的延长线段（8 段）。
+
+    9 区划分、逐边判定用的边界线与窗口框线是同一位置：若整条画上去，
+    灰色/橙色线会压在红色窗口框上（用户反馈"演示中边界颜色全变了"）。
+    这里把每条边拆成窗口外的两截，红框本身保持完整可见。
+    坐标按格子边缘（右/下 = x1+1 / y1+1），与 boundary_guide 口径一致。
+
+    返回 [(边名, a, b), ...]，边名 ∈ left/right/top/bottom。
+    """
+    rx0, ry0, rx1, ry1 = rect
+    ox1, oy1 = rx1 + 1, ry1 + 1          # 闭区间 → 连续外边界
+    bx0, by0, bx1, by1 = rx0 - ext, ry0 - ext, ox1 + ext, oy1 + ext
+    return [("left", (rx0, by0), (rx0, ry0)),
+            ("left", (rx0, oy1), (rx0, by1)),
+            ("right", (ox1, by0), (ox1, ry0)),
+            ("right", (ox1, oy1), (ox1, by1)),
+            ("top", (bx0, ry0), (rx0, ry0)),
+            ("top", (ox1, ry0), (bx1, ry0)),
+            ("bottom", (bx0, oy1), (rx0, oy1)),
+            ("bottom", (ox1, oy1), (bx1, oy1))]
+
+
 def rect_guide(xy: Tuple[int, int, int, int],
                color: str = "#E5484D") -> dict:
     """矩形注记（裁剪窗口边框）。xy = (x0, y0, x1, y1)。"""
     return {"kind": "rect", "xy": tuple(int(v) for v in xy), "color": color}
 
 
-def label_guide(xy: Pixel, text: str, color: str = GUIDE_REF) -> dict:
-    """文字注记（挂在某个像素位置旁边）。"""
+def polygon_guide(points, color: str = GUIDE_HIT, dash: bool = True,
+                  width: float = 2.2) -> dict:
+    """多边形轮廓注记（Sutherland-Hodgman 的"当前结果多边形"）。
+
+    与 Step.pixels 分离：逐边裁剪的中间多边形是算法的演算产物，
+    若混进像素，演示层就会与"原图像素"求交而被整段过滤掉
+    （用户反馈：看不到逐顶点生长的过程）。顶点按格心绘制，首尾自动闭合。
+    """
+    return {"kind": "polygon",
+            "points": [(int(p[0]), int(p[1])) for p in points],
+            "color": color, "dash": dash, "width": float(width)}
+
+
+def label_guide(xy: Pixel, text: str, color: str = GUIDE_REF,
+                align: str = "left", valign: str = "above") -> dict:
+    """文字注记（挂在某个像素位置旁边）。
+
+    align：left / center / right —— 文字相对锚点的水平对齐；
+    valign：above / middle / below —— 相对锚点格的垂直位置。
+    默认保持旧行为（锚点右侧、格子之上）；分区标签用 center+middle
+    才能真正居中在区域里，边界名用 right/left 才能贴边而不压到窗口。
+    """
     return {"kind": "label", "xy": (int(xy[0]), int(xy[1])),
-            "text": str(text), "color": color}
+            "text": str(text), "color": color,
+            "align": align, "valign": valign}
 
 
 @dataclass
@@ -97,6 +170,12 @@ class Step:
     # 不进入最终像素，保证"末帧像素 = 几何结果"的双出口一致性。
     # 放在最后：保持 Step(pixels, values, note) 的既有位置参数调用不变。
     guides: List[dict] = field(default_factory=list)
+
+    # 显示用的浅色像素（填充区）：必须是 pixels 的子集。
+    # 演示层用淡色画这一部分、用主色画其余 —— 否则填充和轮廓同一颜色，
+    # 分不清哪是图形边界、哪是填充（用户反馈）。不参与任何几何判定，
+    # 也不影响"末帧像素 = 几何结果"的契约。
+    tint: List[Pixel] = field(default_factory=list)
 
 
 def expand_steps(steps: List["Step"]) -> List[Pixel]:

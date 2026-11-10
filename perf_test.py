@@ -20,6 +20,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows 控制台默认 GBK，输出 ✓/✗ 会 UnicodeEncodeError —— 强制 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import QImage, QPainter, QColor, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import QApplication

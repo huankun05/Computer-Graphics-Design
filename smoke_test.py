@@ -19,6 +19,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows 控制台默认 GBK，输出 ✓/✗ 会 UnicodeEncodeError —— 强制 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QPushButton, QToolButton
@@ -493,9 +500,9 @@ expect(True, "网格前景层绘制 + 800% 极限缩放无死循环")
 
 # 7.2 演示页加载
 demo_view = win.demo_view
-expect(len(demo_view._all_pages) == 16,
+expect(len(demo_view._all_pages) == 17,
        f"演示页 {len(demo_view._all_pages)} 个"
-       "（模块一 3 + 模块二 6 + 变换 4 + 裁剪 3）")
+       "（模块一 3 + 模块二 6 + 变换 4 + 裁剪 4）")
 from modules.module02_primitives.demos import (CircleDemo, LineDemo,
                                                CompareDemo, PolygonDemo, FillDemo)
 gd = next(d for d in demo_view._all_pages if isinstance(d, CompareDemo))
@@ -1118,7 +1125,7 @@ expect(any("波前" in st.values for st in demo_view.player.steps),
 demo_view.player.pause()
 demo_view.to_end()
 app.processEvents()
-_done_colors = {c for (c, _ins) in demo_view.canvas.demo._done}
+_done_colors = {k[0] for k in demo_view.canvas.demo._done}
 expect(_done_colors == {"#3E63DD", "#F76B15"},
        f"最终画面同时保留两种算法颜色（{sorted(_done_colors)}）")
 demo_view._on_replay_finished()

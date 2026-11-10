@@ -28,6 +28,13 @@ import random
 import sys
 from collections import deque
 
+# Windows 控制台默认 GBK，输出 ✓/✗ 会 UnicodeEncodeError —— 强制 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from algorithms.line_dda import dda_line
 from algorithms.line_bresenham import bresenham_line
 from algorithms.circle_dda import dda_circle

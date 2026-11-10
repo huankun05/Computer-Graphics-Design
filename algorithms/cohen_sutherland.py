@@ -21,7 +21,9 @@ cohen_sutherland_steps() 的末步像素与几何结果逐像素一致。
 from typing import List, Optional, Tuple
 
 from algorithms.line_bresenham import bresenham_line
-from algorithms.steps import (GUIDE_HIT, GUIDE_MARK, Step, point_guide,
+from algorithms.steps import (GUIDE_HIT, GUIDE_MARK, GUIDE_MOVE, Step,
+                              arrow_guide, edge_guide, label_guide,
+                              point_guide,
                               rect_guide)
 
 LEFT, RIGHT, TOP, BOTTOM = 1, 2, 4, 8
@@ -143,12 +145,18 @@ def cohen_sutherland_steps(x0: int, y0: int, x1: int, y1: int,
         seg = bresenham_line(p0[0], p0[1], p1[0], p1[1])
         values = {"区域码0": code_text(c0), "区域码1": code_text(c1),
                   "与 / 或": f"{c0 & c1:04b} / {c0 | c1:04b}",
-                  "端点0": p0, "端点1": p1, "交点": "—"}
+                  "端点0": p0, "端点1": p1, "交点": "—",
+                  "使用边界": "—"}
         # 两端点直接标出二进制码，画面上就能对上监视器
         marks = [point_guide(p0, f"{c0:04b}", GUIDE_MARK),
                  point_guide(p1, f"{c1:04b}", GUIDE_MARK)]
         if not (c0 | c1):
-            steps.append(Step(sorted(set(seg)),
+            # 四舍五入可能把交点推出半格：与几何出口一致钳回窗口内，
+            # 保证"末步像素 == cohen_sutherland() 结果"的双出口契约
+            ax, ay = _clamp(p0[0], rx0, rx1), _clamp(p0[1], ry0, ry1)
+            bx, by = _clamp(p1[0], rx0, rx1), _clamp(p1[1], ry0, ry1)
+            final = bresenham_line(ax, ay, bx, by)
+            steps.append(Step(sorted(set(final)),
                               {**values, "判定": "接受"},
                               "或 = 0000 → 整段接受",
                               guides=[frame, *marks]))
@@ -163,16 +171,37 @@ def cohen_sutherland_steps(x0: int, y0: int, x1: int, y1: int,
         side = ("上边界" if code & TOP
                 else "下边界" if code & BOTTOM
                 else "右边界" if code & RIGHT else "左边界")
+        edge = ("top" if code & TOP else "bottom" if code & BOTTOM
+                else "right" if code & RIGHT else "left")
         px, py = _intersect(fx0, fy0, fx1, fy1, code, rect)
         hit = (int(round(px)), int(round(py)))
-        steps.append(Step(
-            sorted(set(seg)),
-            {**values, "判定": "求交", "交点": hit},
-            f"与 = 0000、或 ≠ 0000 → 按{side}求交 → "
-            f"({px:.1f}, {py:.1f})",
-            guides=[frame, *marks, point_guide(hit, "交点", GUIDE_HIT)]))
+        # 被替换的那个端点：画一条"外端点 → 交点"的箭头，
+        # 让"这一轮截掉的是哪一段"一眼可见（用户反馈：过程要看得清）
+        old = (int(round(fx0)), int(round(fy0))) if code == c0 \
+            else (int(round(fx1)), int(round(fy1)))
+        # 先更新端点、按【裁剪后】的线段出像素：宣布"与左边界求交"的
+        # 这一步，画面上就要看到线段已经缩到交点（外段同步褪色）——
+        # 若用更新前的 seg，画面比解说晚一步（用户反馈：动画不对）
         if code == c0:
             fx0, fy0 = px, py
         else:
             fx1, fy1 = px, py
+        p0 = (int(round(fx0)), int(round(fy0)))
+        p1 = (int(round(fx1)), int(round(fy1)))
+        seg = bresenham_line(p0[0], p0[1], p1[0], p1[1])
+        round_no = len([s for s in steps if s.values.get("判定") == "求交"]) + 1
+        steps.append(Step(
+            sorted(set(seg)),
+            {**values, "判定": "求交", "交点": hit, "使用边界": side},
+            f"与 = 0000、或 ≠ 0000 → 按{side}求交 → "
+            f"({px:.1f}, {py:.1f})",
+            guides=[frame,
+                    edge_guide(rect, edge,
+                               label=f"第 {round_no} 轮 · 用{side}"),
+                    *marks,
+                    arrow_guide(old, hit, GUIDE_MOVE),
+                    point_guide(old, "外端点", GUIDE_MARK),
+                    point_guide(hit, "交点", GUIDE_HIT),
+                    label_guide(hit, f"→ 交点({hit[0]},{hit[1]})",
+                                GUIDE_HIT, align="left", valign="below")]))
     return steps

@@ -151,6 +151,7 @@ class CanvasView(QGraphicsView):
         # 演示页悬停注记：callable(x, y) -> guides（区域码分区等），无则 None
         self.hover_guide_fn = None
         self._hover_pos = None               # 最近一次鼠标位置（模拟像素）
+        self._hover_active = False           # 鼠标是否在画布上（进入置位、离开清零）
 
         # ---- 算法下拉 / 填充切换（选项条驱动的全局绘图态） ----
         self.algorithm = "line_dda"     # 当前算法键（形状→算法清单在 tools/ 声明）
@@ -1308,20 +1309,36 @@ class CanvasView(QGraphicsView):
     # ==================================================================
     # 鼠标事件：平移 / 交给工具
     # ==================================================================
+    def enterEvent(self, event):
+        """鼠标进入画布：立刻按最近位置补画悬停注记（不必等第一次移动）。"""
+        self._hover_active = True
+        self.refresh_hover()
+        super().enterEvent(event)
+
     def leaveEvent(self, event):
         """鼠标离开画布：清掉悬停注记（区域码分区），不残留。"""
+        self._hover_active = False
         self.demo.clear_hover()
         super().leaveEvent(event)
 
     def refresh_hover(self):
-        """按当前鼠标位置重算悬停注记（参数改动后也调用，避免分区画面过期）。"""
+        """按当前鼠标位置重算悬停注记（参数改动后也调用，避免分区画面过期）。
+
+        hover_guides(x, y, canvas) 第三个参数是画布本身：分区范围要按当前
+        视口算，不能只给坐标。鼠标不在画布上（未进入 / 已离开）时不画。
+        """
         if self.hover_guide_fn is None or self._hover_pos is None:
             return
-        if not self.underMouse():
+        if not self._hover_active:
             return
-        self.demo.set_hover(self.hover_guide_fn(*self._hover_pos))
+        x, y = self._hover_pos
+        self.demo.set_hover(self.hover_guide_fn(x, y, self))
 
     def mousePressEvent(self, event: QMouseEvent):
+        # 按下即收起悬停分区：接下来是拖拽窗口/图元，没必要每帧重算分区
+        if event.button() == Qt.LeftButton:
+            self._hover_active = False
+            self.demo.clear_hover()
         # 空格+左键 或 中键：进入平移（PS 风格抓手）
         if event.button() == Qt.MiddleButton or \
                 (event.button() == Qt.LeftButton and self._space_pressed):
@@ -1393,7 +1410,14 @@ class CanvasView(QGraphicsView):
         pos = self._to_pos(event)
         self.cursor_changed.emit(int(pos.x()), int(pos.y()))
         self._hover_pos = (pos.x(), pos.y())
-        self.refresh_hover()
+        # 只在"鼠标空手悬停"时画分区：拖拽窗口/图元时先收起悬停层，
+        # 否则每移动一像素就重算分区并重绘整张画布，拖动会发涩
+        if event.buttons() == Qt.NoButton and not self._move_ctx:
+            self._hover_active = True
+            self.refresh_hover()
+        elif self._hover_active:
+            self._hover_active = False
+            self.demo.clear_hover()
         if self._move_ctx:
             # 变换预览用未量化浮点模拟坐标：缩放比例连续平滑，
             # 移动增量在 update_move 内部 int() 取整到所在格
@@ -1419,6 +1443,14 @@ class CanvasView(QGraphicsView):
         elif event.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
+        # 松手后光标若仍在画布上，立即恢复悬停分区（不必再晃一下鼠标）
+        if event.buttons() == Qt.NoButton and \
+                self.viewport().rect().contains(
+                    event.position().toPoint()):
+            pos = self._to_pos(event)
+            self._hover_pos = (pos.x(), pos.y())
+            self._hover_active = True
+            self.refresh_hover()
         super().mouseReleaseEvent(event)
 
     # ==================================================================

@@ -21,8 +21,8 @@
   图元光栅像素 ∩ 掩膜 → 写入该图元的擦除掩码。
   掩码随图元一起参与后续平移/旋转/缩放，撤销走快照。
 
-注意：标准裁剪算法（Cohen-Sutherland / Liang-Barsky / Sutherland-Hodgman）
-      仍可在演示模式的三个裁剪演示页中逐帧观察。
+注意：标准裁剪算法（Cohen-Sutherland / 中点分割 / Liang-Barsky /
+      Sutherland-Hodgman）仍可在演示模式的四个裁剪演示页中逐帧观察。
 =====================================================================
 """
 
@@ -98,11 +98,14 @@ class ClipTool(ToolBase):
         self._msg_text = "画好窗口后按 Enter 才挖除"
         self._mask_key = None
         self._mask = set()
-        # 演示模式预览：窗口驱动演示步骤，同时回车也真实挖除（可撤销），
-        # 仅用于切换提示文案（演示页挖完保留窗口）
+        # 演示模式预览：窗口驱动演示步骤，同时回车也真实挖除（可撤销）
         self.preview_only = False
         # 窗口变化回调（演示页用它把画布拖出的窗口回填到参数卡）
         self.window_changed = None
+        # 演示页接管钩子：确认挖除（Enter/双击/按钮/参数框回车）时先问宿主——
+        # 宿主返回 True 表示"先播判定动画，播完再挖"，本轮不直接挖除
+        self.confirm_hook = None
+        self._hook_applying = False
         # 参数框回车中转（面板重建后重新挂到新的输入框上）
         self._enter_filter = _EnterFilter(self)
         # 裁剪工具不参与"选中后拖动"，避免与定义窗口冲突
@@ -503,12 +506,17 @@ class ClipTool(ToolBase):
         return abs(p[0] - q[0]) <= 1 and abs(p[1] - q[1]) <= 1
 
     def _rect_handle(self, p):
-        """矩形窗口手柄命中：角/边中点返回名称，内部返回 'inside'。"""
+        """矩形窗口手柄命中：角/边中点返回名称，内部返回 'inside'。
+
+        手柄画在框线上，右/下在闭区间外沿 x1+1 / y1+1——命中判定跟画的一致，
+        否则"看得见却抓不住"。
+        """
         x0, y0, x1, y1 = self.rect
-        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        handles = (("nw", x0, y0), ("n", cx, y0), ("ne", x1, y0),
-                   ("e", x1, cy), ("se", x1, y1), ("s", cx, y1),
-                   ("sw", x0, y1), ("w", x0, cy))
+        ox1, oy1 = x1 + 1, y1 + 1
+        cx, cy = (x0 + ox1) / 2.0, (y0 + oy1) / 2.0
+        handles = (("nw", x0, y0), ("n", cx, y0), ("ne", ox1, y0),
+                   ("e", ox1, cy), ("se", ox1, oy1), ("s", cx, oy1),
+                   ("sw", x0, oy1), ("w", x0, cy))
         for name, hx, hy in handles:
             if abs(p[0] - hx) <= _HANDLE_TOL and \
                     abs(p[1] - hy) <= _HANDLE_TOL:
@@ -548,9 +556,12 @@ class ClipTool(ToolBase):
 
     def _draw_rect_handles(self, painter, SIM, r):
         x0, y0, x1, y1 = r
-        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        pts = ((x0, y0), (cx, y0), (x1, y0), (x1, cy),
-               (x1, y1), (cx, y1), (x0, y1), (x0, cy))
+        # 手柄落在窗口框线上：右/下是闭区间外沿 (x1+1)/(y1+1)，
+        # 用 x1 会缩进窗口内一格，和虚线框对不齐（用户反馈：边界显示）
+        ox1, oy1 = x1 + 1, y1 + 1
+        cx, cy = (x0 + ox1) / 2.0, (y0 + oy1) / 2.0
+        pts = ((x0, y0), (cx, y0), (ox1, y0), (ox1, cy),
+               (ox1, oy1), (cx, oy1), (x0, oy1), (x0, cy))
         painter.setPen(QPen(CLIP_COLOR, 1))
         painter.setBrush(QBrush(QColor(255, 255, 255)))
         for x, y in pts:
@@ -586,7 +597,7 @@ class ClipTool(ToolBase):
 
     def _draw_hint(self, painter, bbox, SIM):
         """窗口下方提示：应用/演示模式都支持 Enter 直接挖除（可撤销）。"""
-        text = ("拖动窗口 / 手柄调整 → 点播放看逐帧 · Enter 直接挖除"
+        text = ("拖动窗口 / 手柄调整 → Enter 播放判定后挖除"
                 if self.preview_only
                 else "Enter / 双击 挖除  ·  Esc 取消")
         f = QFont(painter.font())
@@ -608,6 +619,10 @@ class ClipTool(ToolBase):
     # 挖除执行（确认后才生效）
     # ------------------------------------------------------------------
     def _apply_all(self, keep_window: bool = False):
+        # 演示页接管：先播判定动画，播完宿主再调回来（_hook_applying）真正挖除
+        if not self._hook_applying and callable(self.confirm_hook) and \
+                self.confirm_hook():
+            return
         if not self.window_vertices():
             self._set_msg("请先定义裁剪窗口（矩形拖拽 / 多边形布点）")
             return
@@ -656,6 +671,70 @@ class ClipTool(ToolBase):
             self._reset_window()
         self._set_msg(f"已挖除 {len(entries)} 个图元的窗口内部分"
                       f"（{total} 像素，Ctrl+Z 可撤销）")
+
+    # ------------------------------------------------------------------
+    # 裁剪执行（演示页播完）：裁去窗口【内】，保留窗口外
+    # ------------------------------------------------------------------
+    def apply_crop(self, subjects, rect, keep_window: bool = False):
+        """区域裁剪：裁掉窗口【内】的像素，窗口外原样保留。
+
+        与 _apply_all（窗口内消失的区域挖除）方向一致——本模块的"裁剪"
+        就是挖掉窗口覆盖的那片区域；演示页的四页动画末帧也按同一口径，
+        播完必须落到同一个结果上，否则动画和画布对不上。
+        只作用于本次演示对象，画布上其它图元不受影响。
+        返回 [(shape, before, after), ...] 供重播前还原。
+        """
+        if not subjects:
+            self._set_msg("画布上没有可裁剪的图元")
+            return []
+        x0, y0, x1, y1 = rect
+
+        def inside(p):
+            return x0 <= p[0] <= x1 and y0 <= p[1] <= y1
+
+        doc = self.canvas.document
+        entries = []                     # [(shape, before, after)]
+        total = 0
+        for s in subjects:
+            if not s.visible:
+                continue
+            outline, fill = rasterize(s)
+            out = {p for p in set(outline) | set(fill) if inside(p)}
+            if not out or out <= s.erased:
+                continue
+            before = snapshot(s)
+            s.erased |= out
+            entries.append((s, before, snapshot(s)))
+            total += len(out)
+        # 依附于被裁图元的油漆桶填充：一起按窗口裁剪
+        ids = {id(s) for s in subjects}
+        for f in doc.shapes:
+            if not isinstance(f, RasterFillShape) or f.owner is None:
+                continue
+            if id(f.owner) not in ids:
+                continue
+            out = {p for p in f.pixels if inside(p)}
+            if not out or out <= f.erased:
+                continue
+            before = snapshot(f)
+            f.erased |= out
+            entries.append((f, before, snapshot(f)))
+            total += len(out)
+
+        if not entries:
+            self._set_msg("裁剪完成：窗口内已无可裁部分")
+            return []
+
+        doc.do(ClipShapesCommand(doc, [], entries))
+        self.canvas._render_base()
+        self.canvas.document_changed.emit()
+        # 播完/确认后红框必须消失：演示模式（preview_only）也不例外，
+        # 否则裁剪结果已经落到画布上、红色窗口却还盖在上面
+        if not keep_window:
+            self._reset_window()
+        self._set_msg(f"已裁剪 {len(entries)} 个图元：窗口内 {total} 像素已裁掉"
+                      f"（保留窗口外，Ctrl+Z 可撤销）")
+        return entries
 
     # ------------------------------------------------------------------
     # 全局回车入口（焦点在窗口参数框时，回车到不了画布）

@@ -102,7 +102,7 @@ from algorithms.steps import Step
 from algorithms.steps import Step
 from core.shapes import (
     LineShape, CircleShape, EllipseShape, PolygonShape,
-    KIND_LINE_DDA, KIND_LINE_BRESENHAM, SIM,
+    KIND_LINE_DDA, KIND_LINE_BRESENHAM, restore, SIM,
 )
 
 
@@ -149,6 +149,7 @@ class DemoView(QWidget):
         self._applied_index = -2      # 叠层已应用到的步（-2 = 未应用）
         self._all_pages = []          # [DemoSpec]
         self._widget_page = None      # 当前装载的无画板交互页（计算过程来源）
+        self._pending_clip_tool = None  # 裁剪页"播完判定动画后自动挖除"的工具
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 6)
@@ -267,7 +268,12 @@ class DemoView(QWidget):
         self._modules_lay.addStretch()
 
     def _on_page_button(self, demo, btn):
-        """目录行点击：互斥选中并加载该演示页。"""
+        """目录行点击：互斥选中并加载该演示页。
+
+        零动画：选页只重建参数卡，不生成不播放（用户自己点播放）。
+        旧页步骤流由 _load_page 清空——换页后不会拿上一页的
+        算法轨迹/边界注记再演一遍（用户反馈"其他裁剪方法演示有问题"）。
+        """
         for d, b in self._page_buttons.items():
             b.setChecked(d is demo)
         self._load_page(demo)
@@ -465,6 +471,10 @@ class DemoView(QWidget):
         画布区整个换成页面控件，参数在画面内调节，播放控制禁用。
         """
         self.player.pause()
+        if not regenerate:
+            # 不沿用上一页的步骤流：换页时播放器必须归零，
+            # 否则没重新生成前还挂着上一页的算法轨迹与边界注记
+            self.player.load([])
         self.current_demo = demo
         is_widget = getattr(demo, "kind", "canvas") == "widget"
         # 面板随页型切换：模块一等交互页没有参数卡/决策项监视/播放控制
@@ -524,10 +534,19 @@ class DemoView(QWidget):
         self._stage.setCurrentIndex(0)
         self._sync_tool(demo)
         # 悬停注记：仅声明 supports_hover 的页（裁剪页的区域码分区）启用
+        # 切页时强制清空 + 复位 _hover_active，防上一页残留状态
         self.canvas.demo.clear_hover()
+        self.canvas._hover_active = False
         self.canvas.hover_guide_fn = (
             demo.hover_guides if getattr(demo, "supports_hover", False)
             else None)
+        self._pending_clip_tool = None      # 换页：未完成的"播完挖除"作废
+        # 裁剪演示页：接管裁剪工具的确认挖除（Enter/双击/按钮/参数框回车）——
+        # 先自动播放判定动画，播完才真正挖除；非裁剪页清掉旧钩子互不残留
+        tool = getattr(self.canvas, "tool", None)
+        if tool is not None and hasattr(tool, "confirm_hook"):
+            tool.confirm_hook = (self._request_animated_clip
+                                 if hasattr(demo, "subject_kind") else None)
 
         self._restore_replay_shapes()  # 切页前恢复上一轮回放的图元显示
         # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢
@@ -674,15 +693,18 @@ class DemoView(QWidget):
         直线对比对靠两个彩色图元天然显示两种结果，圆/填充的对比
         只存在于叠层上，清掉就只剩一种颜色（用户反馈）。
         """
+        pending = self._pending_clip_tool
+        if pending is not None:
+            # 裁剪页"确认裁剪"接管的收尾：判定动画播完 → 真正裁剪画布。
+            # 动画末帧 = 裁去窗口内、保留窗口外，画布必须落到同一结果
+            self._pending_clip_tool = None
+            self._finish_clip_playback()
+            return
+        if self._is_clip_page():
+            # 播放按钮/自动播放同样要落到真实裁剪结果：两条路径结果一致
+            self._finish_clip_playback()
+            return
         if self._replay_shapes:
-            if hasattr(self.current_demo, "subject_kind"):
-                # 裁剪页：终帧定格为"裁剪后的结果"，来源图元继续保持隐藏，
-                # 橙色被裁部分清除——末帧必须等于算法输出（双出口一致）。
-                # 真正改动画布仍由 Enter 挖除（可撤销）；换页/重播时恢复原件。
-                self._keep_overlay_at_finish = False
-                self.canvas.demo.solidify()
-                self.canvas.demo.clear_reference()
-                return
             if callable(getattr(self.current_demo, "reference_pixels", None)):
                 # 变换页：终帧定格为实色，并清除橙色初始态参考层——
                 # 到达最终状态后初始状态消失，画面只剩终态；来源图元
@@ -766,6 +788,7 @@ class DemoView(QWidget):
         self.canvas.demo.reset()
         self._restore_replay_shapes()
         self._replay_source = []
+        self._pending_clip_tool = None
         for d in self._all_pages:     # 填充对比的区域登记一并失效
             if isinstance(d, CompareDemo):
                 d._fill_shape = None
@@ -821,8 +844,14 @@ class DemoView(QWidget):
             return
         if getattr(self.current_demo, "kind", "canvas") == "widget":
             return                # 无画板交互页没有步骤流，参数即画面
+        # 任何重生成 = 新意图：作废未完成的"播完挖除"
+        # （接管钩子内部也走这里，它在返回后才登记 pending，顺序不冲突）
+        self._pending_clip_tool = None
         # 页内算法下拉切换 → 画布工具算法即时跟随（直线/圆/填充皆然）
         self._sync_tool(self.current_demo)
+        # 裁剪页：上一轮播完已真实裁剪，改窗口/重播前先还原原图，
+        # 否则新步骤会以"已经被裁过的图"为起点，窗口放大后也补不回来
+        self._restore_clip_result()
         self._restore_replay_shapes()   # 上一轮播放隐藏的来源先恢复，避免残留
         # 填充对比必须先有用户选定的封闭图形：没有就不生成任何步骤
         # （不再回落内置示例多边形，用户明确要求对自己画的图形做对比）
@@ -890,12 +919,23 @@ class DemoView(QWidget):
     def _on_index_changed(self, index: int, incremental: bool):
         steps = self.player.steps
         if index < 0:
+            had = self._applied_index >= 0
             self.canvas.demo.reset()
             self._applied_index = -1
             self.monitor.clear()
             self._update_progress(-1)
             self._sync_reference(index)
+            # 回退/重放到起点：层已清空，被隐藏的演示来源图元恢复可见。
+            # 初次装载（还没有任何步骤落地）不能恢复——否则刚提交图元就
+            # 被"从无到有"回放露出来（对比页表现为图元对没有收起）
+            if had:
+                self._restore_replay_shapes()
             return
+        # 裁剪页：第 0 步落地的同一帧再隐藏原图——黑轮廓与蓝色完整轮廓
+        # 同一次重绘完成，看到的是"直接换色"，不会先空一帧（用户反馈）。
+        # 直接跳末帧（未经过第 0 步）同样要隐藏，否则原图一直垫在下面
+        if self._is_clip_page() and self._applied_index < 0:
+            self._rehide_for_replay()
         if incremental and index == self._applied_index + 1:
             step = steps[index]
             self.canvas.demo.advance(step, self._step_color(step))
@@ -949,7 +989,10 @@ class DemoView(QWidget):
             # 变换演示页：开播即清掉选中框/手柄，并隐藏来源图元——
             # 画面上只剩逐帧被矩阵变换的轨迹，而不是"原件站着+克隆在动"
             self.canvas.set_selection([])
-            self._rehide_for_replay()
+            # 裁剪页例外：隐藏动作推迟到第 0 步落地时（见 _on_index_changed），
+            # 否则开播到第一帧之间会有一段"图元已隐藏、还没画上"的空白
+            if not self._is_clip_page():
+                self._rehide_for_replay()
 
     def _update_progress(self, index: int):
         n = len(self.player.steps)
@@ -969,6 +1012,69 @@ class DemoView(QWidget):
     def _is_canvas_page(self) -> bool:
         return getattr(self.current_demo, "kind", "canvas") == "canvas"
 
+    def _is_clip_page(self) -> bool:
+        """当前是否是区域裁剪演示页（四页共用 _ClipDemoBase）。"""
+        return hasattr(self.current_demo, "subject_kind")
+
+    def _restore_clip_result(self):
+        """裁剪页：撤销上一轮播完的真实裁剪，回到原图再重新演示。
+
+        只撤销本演示页自己记录的那一次编辑——画布上其它图元的编辑不受影响。
+        """
+        demo = self.current_demo
+        entries = getattr(demo, "_last_clip_entries", None)
+        if not entries:
+            return
+        demo._last_clip_entries = []
+        for s, before in entries:
+            restore(s, before)
+        self.canvas._render_base()
+        self.canvas.viewport().update()
+
+    def _finish_clip_playback(self):
+        """裁剪页播完收尾：按动画窗口真实裁剪画布（裁去窗口内、保留窗口外）。
+
+        动画末帧 = 算法输出（窗口外保留部分），播完必须落到同一结果：
+        恢复图元可见 → 按同一窗口擦除窗口内像素（可 Ctrl+Z 撤销）→
+        清演示叠层/注记/红框。与 Enter 触发的路径完全一致。
+        裁剪前的快照记在演示页上，改窗口/重播前先还原原图再演。
+        """
+        demo = self.current_demo
+        tool = getattr(self.canvas, "tool", None)
+        rect = None
+        getter = getattr(demo, "window_rect", None)
+        if callable(getter):
+            try:
+                rect = tuple(getter())
+            except (KeyError, ValueError):
+                rect = None
+        # 裁剪只处理可见图元
+        self._restore_replay_shapes()
+        src = None
+        src_getter = getattr(demo, "playback_source", None)
+        if callable(src_getter):
+            src = src_getter()
+        entries = []
+        if (tool is not None and rect is not None and src is not None
+                and hasattr(tool, "apply_crop")):
+            # 让工具窗口 = 动画窗口：画布红框、裁剪结果、动画三者同一窗口
+            tool.rect = rect
+            tool._mask_key = None
+            if hasattr(tool, "_sync_spins"):
+                tool._sync_spins()
+            tool._hook_applying = True
+            try:
+                entries = tool.apply_crop([src], rect, keep_window=False) or []
+            finally:
+                tool._hook_applying = False
+        demo._last_clip_entries = [(s, b) for s, b, _a in entries]
+        msg = getattr(tool, "_msg_text", "") if tool is not None else ""
+        # 叠层/注记/红框全部清掉，画面只剩真实裁剪后的图元
+        self.canvas.demo.reset()
+        self._applied_index = -1
+        if msg:
+            self.progress_label.setText(msg)
+
     def _transform_source_changed(self) -> bool:
         """变换演示页：当前选中对象与已生成步骤的来源不同 → 需重生成。"""
         getter = getattr(self.current_demo, "playback_source", None)
@@ -982,6 +1088,54 @@ class DemoView(QWidget):
         """裁剪演示页：画布上拖出/调整过窗口 → 步骤流需按新窗口重生成。"""
         fn = getattr(self.current_demo, "consume_dirty", None)
         return bool(fn()) if callable(fn) else False
+
+    def _request_animated_clip(self) -> bool:
+        """裁剪演示页接管"确认挖除"：先自动播放判定动画，播完才真正挖除。
+
+        挂在 ClipTool.confirm_hook 上（Enter/双击/面板按钮/参数框回车都走这）。
+        返回 True = 已接管（工具本轮不直接挖除）；无可演示内容时返回 False，
+        让工具按原逻辑立即挖除并给出提示。
+        """
+        demo = self.current_demo
+        tool = getattr(self.canvas, "tool", None)
+        if demo is None or tool is None or \
+                not hasattr(demo, "subject_kind"):
+            return False
+        rect = getattr(tool, "rect", None)
+        if rect is None:                # 无窗口/多边形窗口：演示页不接管
+            return False
+        # 动画对象 = 即将被挖除的图元：_pinned_source 会记住上次演示的对象，
+        # A 裁完再框 B 时若不改钉，动画还在 A 上、挖的却是 B（用户反馈）。
+        # 取窗口实际命中的最上层可见图元钉住；窗口内没有可挖对象则不接管，
+        # 让工具直接给出"没有可挖除像素"的提示，而不是空播一场动画。
+        get_subjects = getattr(demo, "subject_shapes", None)
+        if callable(get_subjects):
+            from core.rasterizer import rasterize
+            x0, y0, x1, y1 = rect
+            hit = None
+            for s in get_subjects():        # 越靠后画的越上层，取最后命中者
+                outline, fill = rasterize(s)
+                if any(x0 <= px <= x1 and y0 <= py <= y1
+                       for px, py in outline) or \
+                   any(x0 <= px <= x1 and y0 <= py <= y1
+                       for px, py in fill):
+                    hit = s
+            if hit is None:
+                return False
+            demo._pinned_source = hit
+        # 画布红框窗口 → 静默回填参数卡，保证"动画窗口 = 即将挖除的窗口"
+        notify = getattr(demo, "_on_canvas_window", None)
+        if callable(notify):
+            notify(tuple(rect))
+            consume = getattr(demo, "consume_dirty", None)
+            if callable(consume):
+                consume()
+        self._regenerate(fit=False, autoplay=True)
+        if not self.player.steps:
+            return False                # 没有可裁剪对象：退回直接挖除（弹提示）
+        self._pending_clip_tool = tool
+        self.progress_label.setText("判定演示播放中…播完自动挖除窗口内部分")
+        return True
 
     def _ensure_generated(self):
         """无步骤时按当前参数生成（不自动播放）——播放类按钮的前置。"""
@@ -1004,7 +1158,14 @@ class DemoView(QWidget):
             return
         if self._replay_selected():
             return
-        self._rehide_for_replay()
+        if self._is_clip_page():
+            # 裁剪页：原图推迟到第 0 步落地时再隐藏（同帧换色，无空白帧）；
+            # 若上一轮已真实裁剪，先还原快照，从完整原图重演
+            if not self.player.is_playing and \
+                    self.player.index >= len(self.player.steps) - 1:
+                self._restore_clip_result()
+        else:
+            self._rehide_for_replay()
         self.player.toggle()
 
     def replay(self):
@@ -1019,7 +1180,11 @@ class DemoView(QWidget):
         if not self.player.steps and self._is_canvas_page():
             self._regenerate(fit=True, autoplay=True)
             return
-        self._rehide_for_replay()   # 先撤销上次播完恢复的画面，再从零重放
+        if self._is_clip_page():
+            # 重播前还原上一轮真实裁剪（快照），动画从完整原图重新开始
+            self._restore_clip_result()
+        else:
+            self._rehide_for_replay()
         self.player.replay()
 
     def step_back(self):

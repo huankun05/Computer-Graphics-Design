@@ -26,6 +26,13 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows 控制台默认 GBK，输出 ✓/✗ 会 UnicodeEncodeError —— 强制 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from PySide6.QtGui import QColor
 
 from algorithms import transform2d as tf
@@ -278,7 +285,8 @@ import random as _rnd
 from algorithms.cohen_sutherland import (cohen_sutherland,
                                          cohen_sutherland_steps, region_code)
 from algorithms.liang_barsky import liang_barsky, liang_barsky_steps
-from algorithms.sutherland_hodgman import clip_polygon, clip_polygon_steps
+from algorithms.sutherland_hodgman import (clip_polygon, clip_polygon_steps,
+                                           polygon_outline)
 from algorithms.line_bresenham import bresenham_line
 
 _rect = (10, 8, 40, 26)
@@ -338,7 +346,11 @@ ok(all(_rect[0] <= x <= _rect[2] and _rect[1] <= y <= _rect[3]
 ok(clip_polygon([(0, 0), (5, 0), (5, 5)], _rect) == [],
    "多边形完全在外 → 空")
 _psteps = clip_polygon_steps(_poly, _rect)
-ok(len(_psteps) == 5, f"Hodgman 步骤流 4 边 + 初始 = {len(_psteps)}")
+ok(len(_psteps) >= 5, f"Hodgman 步骤流逐顶点演示 {len(_psteps)} 步")
+ok(_psteps[-1].pixels == sorted(set(polygon_outline(_clip))) if _clip else True,
+   "Hodgman 末步像素 = clip_polygon 结果（双出口契约）")
+ok(all(st.pixels == sorted(set(st.pixels)) for st in _psteps),
+   "Hodgman 每步像素有序去重")
 print(f"    PASS（{PASS} 项）")
 
 

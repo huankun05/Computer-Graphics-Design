@@ -21,7 +21,9 @@
 from typing import List, Optional, Tuple
 
 from algorithms.line_bresenham import bresenham_line
-from algorithms.steps import (GUIDE_HIT, GUIDE_REF, Step, line_guide,
+from algorithms.steps import (GUIDE_HIT, GUIDE_MOVE, GUIDE_REF, Step,
+                              arrow_guide, boundary_guide,
+                              border_extension_segments, edge_guide,
                               point_guide, rect_guide)
 
 Rect = Tuple[int, int, int, int]
@@ -59,15 +61,20 @@ def liang_barsky(x0: int, y0: int, x1: int, y1: int,
     return ax, ay, bx, by
 
 
-def _border_guides(rect: Rect):
-    """四条窗口边界的注记线（配合参数卡逐条判定）。"""
-    rx0, ry0, rx1, ry1 = rect
-    return [
-        line_guide((rx0, ry0), (rx0, ry1), GUIDE_REF),     # 左
-        line_guide((rx1, ry0), (rx1, ry1), GUIDE_REF),     # 右
-        line_guide((rx0, ry0), (rx1, ry0), GUIDE_REF),     # 上
-        line_guide((rx0, ry1), (rx1, ry1), GUIDE_REF),     # 下
-    ]
+def _border_guides(rect: Rect, hot: str = ""):
+    """四条窗口边界的注记线（配合参数卡逐条判定）。
+
+    只画窗口【外侧】的延长段（border_extension_segments）：边界线与
+    红色窗口框本来重合，整条画上去会把红框染成灰色/橙色（用户反馈
+    "演示过程边界颜色全变了"）。hot = 当前正在判定的边界名，用橙色
+    实线高亮其延长段，其余灰色虚线。
+    """
+    names = {"left": "左边界", "right": "右边界",
+             "top": "上边界", "bottom": "下边界"}
+    return [boundary_guide(a, b,
+                           "#F76B15" if names[edge] == hot else GUIDE_REF,
+                           dash=names[edge] != hot)
+            for edge, a, b in border_extension_segments(rect, ext=3)]
 
 
 def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
@@ -79,11 +86,12 @@ def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
     """
     rx0, ry0, rx1, ry1 = rect
     frame = rect_guide(rect)
-    edges = _border_guides(rect)
     dx, dy = float(x1 - x0), float(y1 - y0)
     p = (-dx, dx, -dy, dy)
     q = (x0 - rx0, rx1 - x0, y0 - ry0, ry1 - y0)
     names = ("左边界", "右边界", "上边界", "下边界")
+    side_of = {"左边界": "left", "右边界": "right",
+               "上边界": "top", "下边界": "bottom"}
     u0, u1 = 0.0, 1.0
     steps: List[Step] = []
 
@@ -109,10 +117,17 @@ def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
 
     steps.append(Step(sorted(set(_seg_at(u0, u1))),
                       _vals("初始", "—", None, None, u0, u1),
-                      f"初始参数区间 [{u0:.2f}, {u1:.2f}]：整条线段",
-                      guides=[frame, *_marks(u0, u1)]))
+                      f"初始参数区间 [{u0:.2f}, {u1:.2f}]：整条线段，"
+                      "四条边界依次判定",
+                      guides=[frame, *_border_guides(rect), *_marks(u0, u1)]))
     for i, (pi, qi) in enumerate(zip(p, q)):
-        base = [frame, edges[i], *_marks(u0, u1)]
+        # 当前边界高亮：整条边压在红框外侧加粗 + 延长段 + 名字，
+        # 让"这一轮在跟哪条边求交"一眼可见
+        base = [frame,
+                edge_guide(rect, side_of[names[i]],
+                           label=f"第 {i + 1} 条 · {names[i]}"),
+                *_border_guides(rect, names[i]), *_marks(u0, u1)]
+        prev = _ends(u0, u1)
         if pi == 0:
             if qi < 0:
                 steps.append(Step(sorted(set(_seg_at(u0, u1))),
@@ -138,13 +153,24 @@ def liang_barsky_steps(x0: int, y0: int, x1: int, y1: int,
             steps.append(Step(sorted(set(_seg_at(u0, u1))),
                               _vals("舍弃", names[i], pi, qi, u0, u1),
                               f"{names[i]}：{act} → u0>u1，舍弃",
-                              guides=[frame, edges[i], *_marks(u0, u1)]))
+                              guides=base))
             return steps
+        # 端点收缩的箭头：p<0 收起点、p>0 收终点，直观看到"哪一端被拉回来"
+        cur = _ends(u0, u1)
+        moved = (arrow_guide((prev[0], prev[1]), (cur[0], cur[1]), GUIDE_MOVE)
+                 if pi < 0 else
+                 arrow_guide((prev[2], prev[3]), (cur[2], cur[3]), GUIDE_MOVE))
         steps.append(Step(sorted(set(_seg_at(u0, u1))),
                           _vals("收窄", names[i], pi, qi, u0, u1),
                           f"{names[i]}：{act}",
-                          guides=[frame, edges[i], *_marks(u0, u1)]))
-    steps.append(Step(sorted(set(_seg_at(u0, u1))),
+                          guides=base + [moved]))
+    # 输出步与几何出口一致：四舍五入可能把交点推出半格，钳回窗口内，
+    # 保证"末步像素 == liang_barsky() 结果"的双出口契约
+    out_ends = (_clamp(int(round(x0 + u0 * dx)), rx0, rx1),
+                _clamp(int(round(y0 + u0 * dy)), ry0, ry1),
+                _clamp(int(round(x0 + u1 * dx)), rx0, rx1),
+                _clamp(int(round(y0 + u1 * dy)), ry0, ry1))
+    steps.append(Step(sorted(set(bresenham_line(*out_ends))),
                       _vals("输出", "—", None, None, u0, u1),
                       f"输出参数区间 [{u0:.3f}, {u1:.3f}] 对应的线段",
                       guides=[frame, *_marks(u0, u1)]))

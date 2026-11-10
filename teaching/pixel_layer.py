@@ -17,7 +17,8 @@
 import math
 
 from PySide6.QtCore import QPointF, Qt, QRectF, QTimer, QLineF
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QPainter,
+                           QPen, QPolygonF)
 
 from core.shapes import SIM
 
@@ -29,10 +30,11 @@ class PixelLayer:
 
     def __init__(self, canvas):
         self._cv = canvas
-        self._done = {}          # (color_name, inset) -> list[QRectF]
+        self._done = {}          # (color_name, inset, tint) -> list[QRectF]
         self._cur_color = None   # 当前步颜色
         self._cur_inset = 0      # 当前步内缩（对比双层用）
-        self._cur = []           # 当前步 QRectF 列表
+        self._cur = []           # 当前步 QRectF 列表（轮廓/主色）
+        self._cur_tint = []      # 当前步的填充像素（淡色，Step.tint）
         self._guides = []        # 当前步演算注记（窗口/交点/轴心/箭头/标签）
         self._hover = []         # 鼠标悬停层（区域码分区等，独立于步骤流）
         self._ref = []           # 初始态参考层（变换动画期间常显）
@@ -53,6 +55,7 @@ class PixelLayer:
         self._accumulate = bool(on)
         self._done.clear()
         self._cur = []
+        self._cur_tint = []
         self._guides = []
         self._hover = []
         self._ref = []
@@ -99,11 +102,20 @@ class PixelLayer:
         self._hover = []
         self._cv.viewport().update()
 
+    def clear_guides(self):
+        """清除演算注记（播放结束定稿时）：窗口边框/交点/标签随步骤流结束，
+        不再压在图元上——否则红框会一直留在成品画面上。"""
+        if not self._guides:
+            return
+        self._guides = []
+        self._cv.viewport().update()
+
     def reset(self):
         """清空整层（载入新算法 / 回退 / 重放时）。"""
         self._timer.stop()
         self._done.clear()
         self._cur = []
+        self._cur_tint = []
         self._guides = []
         self._hover = []
         self._cur_color = None
@@ -120,9 +132,13 @@ class PixelLayer:
         定格后与直线对比对的实色图元观感一致。
         """
         if self._cur:
-            self._done.setdefault((self._cur_color, self._cur_inset),
+            self._done.setdefault((self._cur_color, self._cur_inset, False),
                                   []).extend(self._cur)
             self._cur = []
+        if self._cur_tint:
+            self._done.setdefault((self._cur_color, self._cur_inset, True),
+                                  []).extend(self._cur_tint)
+            self._cur_tint = []
         self._cur_color = None
         self._timer.stop()
         self._blink = False
@@ -138,8 +154,11 @@ class PixelLayer:
         """
         if self._accumulate:
             if self._cur:
-                self._done.setdefault((self._cur_color, self._cur_inset),
+                self._done.setdefault((self._cur_color, self._cur_inset, False),
                                       []).extend(self._cur)
+            if self._cur_tint:
+                self._done.setdefault((self._cur_color, self._cur_inset, True),
+                                      []).extend(self._cur_tint)
         else:
             self._done.clear()
         self._cur_color = color
@@ -148,9 +167,14 @@ class PixelLayer:
         self._cur_inset = int(step.values.get("inset", 0)
                               if isinstance(step.values, dict) else 0)
         i = self._cur_inset
+        # Step.tint = 填充像素（pixels 的子集）：用淡色画，和轮廓分开
+        tint = {tuple(p) for p in (getattr(step, "tint", None) or [])}
         # 步骤像素是模拟像素坐标 → 渲染为 SIM×SIM 方块（一格 = 一像素）
         self._cur = [QRectF(x * SIM + i, y * SIM + i, SIM - 2 * i, SIM - 2 * i)
-                     for x, y in step.pixels]
+                     for x, y in step.pixels if (x, y) not in tint]
+        self._cur_tint = [QRectF(x * SIM + i, y * SIM + i,
+                                 SIM - 2 * i, SIM - 2 * i)
+                          for x, y in step.pixels if (x, y) in tint]
         if self._accumulate and not self._timer.isActive():
             self._timer.start()
         self._cv.viewport().update()
@@ -170,11 +194,22 @@ class PixelLayer:
             painter.drawRects(self._ref)
         if self._done:
             painter.setPen(Qt.NoPen)
-            for (color_name, _inset), rects in self._done.items():
+            for (color_name, _inset, is_tint), rects in self._done.items():
                 c = QColor(color_name)
-                c.setAlpha(255 if self._solid else 115)
+                if is_tint:
+                    c = c.lighter(165)
+                    c.setAlpha(255 if self._solid else 85)
+                else:
+                    c.setAlpha(255 if self._solid else 115)
                 painter.setBrush(c)
                 painter.drawRects(rects)
+        # 填充像素：淡色（与轮廓的主色区分开，用户反馈"边框和填充一个颜色"）
+        if self._cur_tint and self._cur_color:
+            c = QColor(self._cur_color).lighter(165)
+            c.setAlpha(210 if (self._solid or not self._accumulate) else 110)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(c)
+            painter.drawRects(self._cur_tint)
         if self._cur and self._cur_color:
             c = QColor(self._cur_color)
             # 替换式固定实色（无呼吸闪烁），避免"停留"时明暗跳动
@@ -254,7 +289,11 @@ class PixelLayer:
         font.setPixelSize(max(10, int(SIM * 0.7)))
         font.setBold(True)
         point_r = max(4.0, SIM * 0.22)
-        for g in self._guides:
+        # 窗口红框永远最后画：边界延长线/当前边界高亮都画在窗口外侧，
+        # 但若某个算法把 rect 注记放在列表前面，这里也保证红框不被盖掉
+        ordered = ([g for g in self._guides if g.get("kind") != "rect"]
+                   + [g for g in self._guides if g.get("kind") == "rect"])
+        for g in ordered:
             color = QColor(g.get("color") or "#3E63DD")
             kind = g.get("kind")
             if kind == "rect":
@@ -264,9 +303,22 @@ class PixelLayer:
                 painter.drawRect(QRectF(x0 * SIM, y0 * SIM,
                                         (x1 - x0 + 1) * SIM,
                                         (y1 - y0 + 1) * SIM))
+            elif kind == "boundary":
+                # 边界线：坐标是【格子边缘】，直接 x*SIM，不加半格——
+                # 否则与红色窗口框差半格（用户反馈的"边界显示"问题）
+                a, b = g["a"], g["b"]
+                painter.setPen(QPen(color, float(g.get("width") or 1.6),
+                                    Qt.DashLine if g.get("dash")
+                                    else Qt.SolidLine))
+                painter.drawLine(QLineF(a[0] * SIM, a[1] * SIM,
+                                        b[0] * SIM, b[1] * SIM))
+            elif kind == "edge":
+                # 当前正在使用的那条窗口边：画在红框外侧 2.5px，
+                # 加粗实线 + 名字，红框本身保持完整可见
+                self._draw_edge(painter, g, color, font)
             elif kind in ("line", "arrow"):
                 a, b = g["a"], g["b"]
-                painter.setPen(QPen(color, 1.6,
+                painter.setPen(QPen(color, float(g.get("width") or 1.6),
                                     Qt.DashLine if g.get("dash")
                                     else Qt.SolidLine))
                 p1 = QPointF(a[0] * SIM + SIM / 2, a[1] * SIM + SIM / 2)
@@ -274,6 +326,20 @@ class PixelLayer:
                 painter.drawLine(p1, p2)
                 if kind == "arrow":
                     self._draw_arrow_head(painter, p1, p2, color, point_r)
+            elif kind == "polygon":
+                # 当前结果多边形（S-H 的中间多边形）：按格心闭合折线绘制。
+                # 与 Step.pixels 分离，不会被"原图像素"求交过滤掉。
+                pts = g.get("points") or []
+                if len(pts) < 2:
+                    continue
+                poly = QPolygonF([
+                    QPointF(p[0] * SIM + SIM / 2, p[1] * SIM + SIM / 2)
+                    for p in pts])
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(color, float(g.get("width") or 2.2),
+                                    Qt.DashLine if g.get("dash")
+                                    else Qt.SolidLine))
+                painter.drawPolygon(poly)
             elif kind == "point":
                 x, y = g["xy"]
                 cx = x * SIM + SIM / 2
@@ -290,12 +356,73 @@ class PixelLayer:
             elif kind == "label":
                 x, y = g["xy"]
                 text = g.get("text") or ""
-                if text:
-                    painter.setFont(font)
-                    painter.setPen(QPen(color))
-                    painter.drawText(QPointF(x * SIM + SIM / 2 + 3,
-                                             y * SIM - 2), text)
+                if not text:
+                    continue
+                painter.setFont(font)
+                painter.setPen(QPen(color))
+                fm = QFontMetricsF(font)
+                w = fm.horizontalAdvance(text) + 4
+                h = fm.height()
+                cx = x * SIM + SIM / 2
+                cy = y * SIM + SIM / 2
+                align = g.get("align", "left")
+                valign = g.get("valign", "above")
+                if align == "center":
+                    left = cx - w / 2
+                elif align == "right":
+                    left = cx - w - 3
+                else:
+                    left = cx + 3
+                if valign == "middle":
+                    top = cy - h / 2
+                elif valign == "below":
+                    top = (y + 1) * SIM + 2
+                else:                       # above：贴在锚点格上沿之外
+                    top = y * SIM - h - 2
+                painter.drawText(QRectF(left, top, w, h),
+                                 Qt.AlignHCenter | Qt.AlignVCenter, text)
         painter.restore()
+
+    @staticmethod
+    def _draw_edge(painter, g: dict, color: QColor, font: QFont):
+        """当前被使用的窗口边：红框外侧 2.5px 的加粗实线 + 名字。"""
+        rx0, ry0, rx1, ry1 = g["rect"]
+        ox1, oy1 = (rx1 + 1) * SIM, (ry1 + 1) * SIM
+        off = 2.5
+        side = g.get("side")
+        if side == "left":
+            a = QPointF(rx0 * SIM - off, ry0 * SIM)
+            b = QPointF(rx0 * SIM - off, oy1)
+        elif side == "right":
+            a = QPointF(ox1 + off, ry0 * SIM)
+            b = QPointF(ox1 + off, oy1)
+        elif side == "top":
+            a = QPointF(rx0 * SIM, ry0 * SIM - off)
+            b = QPointF(ox1, ry0 * SIM - off)
+        else:
+            a = QPointF(rx0 * SIM, oy1 + off)
+            b = QPointF(ox1, oy1 + off)
+        painter.setPen(QPen(color, 3.0, Qt.SolidLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(a, b)
+        text = g.get("label") or ""
+        if not text:
+            return
+        painter.setFont(font)
+        painter.setPen(QPen(color))
+        fm = QFontMetricsF(font)
+        w = fm.horizontalAdvance(text) + 4
+        h = fm.height()
+        mx, my = (a.x() + b.x()) / 2, (a.y() + b.y()) / 2
+        if side == "left":
+            rect = QRectF(a.x() - w - 4, my - h / 2, w, h)
+        elif side == "right":
+            rect = QRectF(a.x() + 4, my - h / 2, w, h)
+        elif side == "top":
+            rect = QRectF(mx - w / 2, a.y() - h - 2, w, h)
+        else:
+            rect = QRectF(mx - w / 2, a.y() + 2, w, h)
+        painter.drawText(rect, Qt.AlignCenter, text)
 
     @staticmethod
     def _draw_arrow_head(painter, p1: QPointF, p2: QPointF,

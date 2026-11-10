@@ -21,6 +21,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows 控制台默认 GBK，输出 ✓/✗ 会 UnicodeEncodeError —— 强制 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 # ---- 新算法层（被测对象） ----
 from algorithms.line_dda import dda_line as dda_new
 from algorithms.line_bresenham import bresenham_line as bre_new
