@@ -23,6 +23,23 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QPainter,
 from core.shapes import SIM
 
 
+def tint_color(color) -> QColor:
+    """主色的"淡色版"——填充区专用色。
+
+    之前用 QColor.lighter(165)：那会把明度顶到接近白色
+    （#4F6EF7 → #EAEEFF），白纸上看不出填充，轮廓与填充看起来
+    像"一个颜色"，边框就消失了（用户反馈："边框和填充弄成一个
+    颜色了，展示不出来"）。
+
+    这里显式与白色按 55% 混合：仍是主色的浅色调（一眼认得出
+    "这是同一个图形的内部"），但和轮廓的主色分得清清楚楚。
+    """
+    c = QColor(color)
+    return QColor(int(c.red() + (255 - c.red()) * 0.55),
+                  int(c.green() + (255 - c.green()) * 0.55),
+                  int(c.blue() + (255 - c.blue()) * 0.55))
+
+
 class PixelLayer:
     """画布前景的教学像素层（由 CanvasView 持有并在 drawForeground 调用）。"""
 
@@ -194,10 +211,15 @@ class PixelLayer:
             painter.drawRects(self._ref)
         if self._done:
             painter.setPen(Qt.NoPen)
-            for (color_name, _inset, is_tint), rects in self._done.items():
+            # 画序：先填充（淡色）后轮廓（主色）。
+            # 之前按插入顺序画，轮廓先落、填充后盖 → 边框被填充吃掉，
+            # 整块图元只剩一个颜色（用户反馈："边框展示不出来"）。
+            # tint 组（is_tint=True）排在前面，轮廓组压在上面。
+            for (color_name, _inset, is_tint), rects in sorted(
+                    self._done.items(), key=lambda kv: 0 if kv[0][2] else 1):
                 c = QColor(color_name)
                 if is_tint:
-                    c = c.lighter(165)
+                    c = tint_color(c)
                     c.setAlpha(255 if self._solid else 85)
                 else:
                     c.setAlpha(255 if self._solid else 115)
@@ -205,7 +227,7 @@ class PixelLayer:
                 painter.drawRects(rects)
         # 填充像素：淡色（与轮廓的主色区分开，用户反馈"边框和填充一个颜色"）
         if self._cur_tint and self._cur_color:
-            c = QColor(self._cur_color).lighter(165)
+            c = tint_color(self._cur_color)
             c.setAlpha(210 if (self._solid or not self._accumulate) else 110)
             painter.setPen(Qt.NoPen)
             painter.setBrush(c)

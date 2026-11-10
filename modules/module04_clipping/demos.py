@@ -40,20 +40,49 @@ REGION_CN = {0: "窗口内", 1: "左", 2: "右", 4: "上", 8: "下",
              5: "左上", 6: "右上", 9: "左下", 10: "右下"}
 
 
-def _outline_pixels_sorted(shape):
+def _outline_pixels_sorted(shape, ignore_erased: bool = False):
     """圆/椭圆 → 真实栅格轮廓的有序点列（按绕中心极角排序）。
 
     不再用参数方程重新采样——那样得到的弦与画布实际栅格化的弧
     （中点圆/椭圆算法）是两套像素，演示轨迹贴不上原图（"两种画法"）。
     直接取 rasterize 的轮廓像素，按极角排成绕圈顺序：相邻点即轮廓上
     相邻像素，微段判定轨迹与原图逐一重合。
+
+    ignore_erased=True 时取【未被裁掉】的完整轮廓：同一图形上做第二次
+    裁剪时，要靠完整轮廓才能看出"哪一段连续、哪一段是上一轮的缺口"。
     """
+    import copy
     import math
     from core.rasterizer import rasterize
-    outline, _fill = rasterize(shape)
+    src = shape
+    if ignore_erased and getattr(shape, "erased", None):
+        src = copy.copy(shape)
+        src.erased = set()
+    outline, _fill = rasterize(src)
     cx, cy = shape.center
     return sorted({(int(x), int(y)) for x, y in outline},
                   key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+
+
+def _alive_runs(px, erased):
+    """像素序列 → 连续存活段（跳过已被裁掉的像素）。
+
+    同一个图形上做第二次裁剪时，边界上留着上一轮挖掉的缺口；判定必须
+    沿存活的连续段走，不能把缺口也当成一条完整边（否则紫色工作线段会
+    横穿已经不存在的部分，用户看到的判定轨迹是假的）。
+    """
+    runs = []
+    cur = []
+    for p in px:
+        if p in erased:
+            if cur:
+                runs.append(cur)
+                cur = []
+            continue
+        cur.append(p)
+    if cur:
+        runs.append(cur)
+    return runs
 
 
 def _outline_points(shape):
@@ -350,18 +379,24 @@ class _LineClipDemo(_ClipDemoBase):
             原轮廓（不用参数方程重采样——那是另一套像素，两种画法会脱节），
             每段又有几像素长——跨窗口边时能看清求交 / 二分 / 参数收窄
             （1~2 像素的微段每段一步就收敛，三页看起来几乎一样，用户反馈）。
+
+        已被裁掉的像素（shape.erased）不参与：同一个图形上做第二次裁剪时，
+        判定要沿【剩下的】边界走，不能跨过上一轮挖空的缺口——否则紫色
+        工作线段会横穿已经不存在的部分，判定轨迹就成了假的。
         """
         from algorithms.line_bresenham import bresenham_line
         from core.shapes import LineShape, PolygonShape
         src = self.playback_source()
         if src is None:
             return []
+        erased = set(getattr(src, "erased", None) or ())
         if isinstance(src, LineShape):
             a = (int(src.p0[0]), int(src.p0[1]))
             b = (int(src.p1[0]), int(src.p1[1]))
-            owned = {(int(x), int(y))
-                     for x, y in bresenham_line(a[0], a[1], b[0], b[1])}
-            return [(a, b, owned)]
+            px = [(int(x), int(y))
+                  for x, y in bresenham_line(a[0], a[1], b[0], b[1])]
+            return [(run[0], run[-1], set(run))
+                    for run in _alive_runs(px, erased)]
         if isinstance(src, PolygonShape):
             pts = [(int(x), int(y)) for x, y in src.vertices]
             out = []
@@ -370,25 +405,24 @@ class _LineClipDemo(_ClipDemoBase):
                 b = pts[(i + 1) % len(pts)]
                 if a == b:
                     continue
-                owned = {(int(x), int(y))
-                         for x, y in bresenham_line(a[0], a[1], b[0], b[1])}
-                out.append((a, b, owned))
+                px = [(int(x), int(y))
+                      for x, y in bresenham_line(a[0], a[1], b[0], b[1])]
+                for run in _alive_runs(px, erased):
+                    out.append((run[0], run[-1], set(run)))
             return out
         # 圆 / 椭圆：真实栅格轮廓 → 极角有序点列 → 每 N 个切一段
-        pts = _outline_pixels_sorted(src)
-        n = len(pts)
-        if n < 2:
-            return []
+        full = _outline_pixels_sorted(src, ignore_erased=True)
         out = []
         step = max(2, self._PIECE_LEN)
-        i = 0
-        while i < n:
-            j = min(i + step, n)              # 本段覆盖 pts[i .. j-1]
-            a, b = pts[i], pts[j - 1]
-            if a != b:
-                owned = {(int(x), int(y)) for x, y in pts[i:j]}
-                out.append((a, b, owned))
-            i = j
+        for run in _alive_runs(full, erased):
+            i = 0
+            while i < len(run):
+                j = min(i + step, len(run))      # 本段覆盖 run[i .. j-1]
+                a, b = run[i], run[j - 1]
+                if a != b:
+                    owned = {(int(x), int(y)) for x, y in run[i:j]}
+                    out.append((a, b, owned))
+                i = j
         return out
 
     def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
@@ -427,8 +461,13 @@ class _LineClipDemo(_ClipDemoBase):
 
         # 起始状态 = 图元真实像素（轮廓 + 填充）
         current = set(self.all_pixels(rect))
-        fill_now = set(self.kept_fill_pixels(rect))      # 窗口外填充（淡色）
-        fill_in = self.cut_fill_pixels(rect)             # 窗口内填充（待挖除）
+        # tint = 【全部】填充像素（轮廓除外），窗口内窗口外都算：
+        # 之前只取窗口外的填充，窗口内的填充就落进了"主色"组，
+        # 和轮廓画成同一个颜色 —— 整块图元一片蓝，边框根本分不出来
+        # （用户反馈："边框和填充弄成一个颜色了，展示不出来"）。
+        # 判定挖除时再把窗口内那部分一起从 current / fill_now 里扣掉。
+        fill_in = self.cut_fill_pixels(rect)                  # 窗口内填充（待挖除）
+        fill_now = set(self.kept_fill_pixels(rect)) | fill_in  # 全部填充像素（淡色）
 
         from algorithms.steps import (GUIDE_MOVE, Step, line_guide, rect_guide)
         steps = []

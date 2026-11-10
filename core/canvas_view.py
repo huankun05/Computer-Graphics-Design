@@ -703,6 +703,17 @@ class CanvasView(QGraphicsView):
         self.document_changed.emit()
         self.shapes_committed.emit(list(shapes))
 
+    def _fill_color_of(self, shape) -> QColor:
+        """图元【填充】部分的颜色。
+
+        画布定义了 fill_color 就用它（演示模式固定主题蓝，与黑色边界
+        明显区分——这本来就是当初写下的设计意图，只是闭合图元的填充
+        一直没接上它，填充和边界只好共用 shape.color）；没定义就退回
+        图元自身的颜色（应用模式：画笔色，观感保持不变）。
+        """
+        c = getattr(self, "fill_color", None)
+        return QColor(c) if c is not None else shape.color
+
     def _paint_shapes(self, shapes):
         """把若干图元增量光栅化进 base（坐标为世界模拟像素 → 平移到纸内）。"""
         ox, oy = self._base_origin
@@ -710,8 +721,8 @@ class CanvasView(QGraphicsView):
         p.translate(-ox * SIM, -oy * SIM)
         for s in shapes:
             outline, fill = rasterize(s)
+            self._plot(p, fill, self._fill_color_of(s), s.inset)
             self._plot(p, outline, s.color, s.inset)
-            self._plot(p, fill, s.color, s.inset)
         p.end()
         self.pix_item.setPixmap(QPixmap.fromImage(self.base_image))
         # 增量绘制同样要整视口刷新，避免前景层的旧选中框/手柄残留
@@ -1049,8 +1060,12 @@ class CanvasView(QGraphicsView):
             if not shape.visible:
                 continue                  # 图元列表里被眼睛隐藏的跳过
             outline, fill = rasterize(shape)
+            # 先填充后轮廓：填充必须画在轮廓【下面】。
+            # 两者同色时填充会把轮廓整圈盖住 → 封闭图元画成一块实心，
+            # 边框（本来是有颜色的）完全看不见（用户反馈："边框和填充
+            # 弄成一个颜色了，展示不出来"）。轮廓最后画 → 边框始终在最上层。
+            self._plot(p, fill, self._fill_color_of(shape), shape.inset)
             self._plot(p, outline, shape.color, shape.inset)
-            self._plot(p, fill, shape.color, shape.inset)
         p.end()
         self.base_image = img
         self.pix_item.setPixmap(QPixmap.fromImage(img))

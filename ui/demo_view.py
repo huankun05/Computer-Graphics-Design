@@ -850,8 +850,12 @@ class DemoView(QWidget):
         # 页内算法下拉切换 → 画布工具算法即时跟随（直线/圆/填充皆然）
         self._sync_tool(self.current_demo)
         # 裁剪页：上一轮播完已真实裁剪，改窗口/重播前先还原原图，
-        # 否则新步骤会以"已经被裁过的图"为起点，窗口放大后也补不回来
-        self._restore_clip_result()
+        # 否则新步骤会以"已经被裁过的图"为起点，窗口放大后也补不回来。
+        # 但只有【还在裁剪页】才还原：切到别的演示页时不能把用户已经
+        # 裁好的结果撤掉（用户反馈："同一个图形上要能做两次操作"）。
+        # 窗口变了 = 新的一次裁剪 → 不还原，结果累积（见 _restore_clip_result）。
+        if self._is_clip_page():
+            self._restore_clip_result()
         self._restore_replay_shapes()   # 上一轮播放隐藏的来源先恢复，避免残留
         # 填充对比必须先有用户选定的封闭图形：没有就不生成任何步骤
         # （不再回落内置示例多边形，用户明确要求对自己画的图形做对比）
@@ -1016,16 +1020,48 @@ class DemoView(QWidget):
         """当前是否是区域裁剪演示页（四页共用 _ClipDemoBase）。"""
         return hasattr(self.current_demo, "subject_kind")
 
-    def _restore_clip_result(self):
+    def _clip_rect_now(self):
+        """当前裁剪演示页的窗口矩形（参数卡口径，闭区间）。
+
+        与 _finish_clip_playback 真正落地的那次裁剪同一口径，用来判断
+        「这次是重播上一轮」还是「换了个窗口做第二次裁剪」。
+        """
+        demo = self.current_demo
+        getter = getattr(demo, "window_rect", None)
+        if not callable(getter):
+            return None
+        try:
+            return tuple(getter())
+        except (KeyError, ValueError):
+            return None
+
+    def _restore_clip_result(self, force: bool = False):
         """裁剪页：撤销上一轮播完的真实裁剪，回到原图再重新演示。
 
         只撤销本演示页自己记录的那一次编辑——画布上其它图元的编辑不受影响。
+
+        force=False（默认）时【只在重播同一个窗口时才还原】：
+        换了窗口 = 新的一次裁剪，必须保留上一轮已经裁掉的部分，
+        否则第二次操作会把第一次的结果整个冲掉（用户反馈："我不能在
+        同一个图形上面进行两次操作，第二次操作会覆盖第一次的操作"）。
+        这种情况下不还原，但把旧快照作废——否则稍后重播会把上一轮
+        的裁剪也一起撤掉。
         """
         demo = self.current_demo
         entries = getattr(demo, "_last_clip_entries", None)
         if not entries:
             return
+        if not force:
+            last = getattr(demo, "_last_clip_rect", None)
+            now = self._clip_rect_now()
+            same = (last is not None and now is not None
+                    and tuple(last) == tuple(now))
+            if not same:
+                demo._last_clip_entries = []
+                demo._last_clip_rect = None
+                return          # 新窗口 = 新的一次裁剪：保留上一轮结果
         demo._last_clip_entries = []
+        demo._last_clip_rect = None
         for s, before in entries:
             restore(s, before)
         self.canvas._render_base()
@@ -1068,6 +1104,9 @@ class DemoView(QWidget):
             finally:
                 tool._hook_applying = False
         demo._last_clip_entries = [(s, b) for s, b, _a in entries]
+        # 记下这一轮真正落地的窗口：下次重播时据此判断"是不是同一轮"
+        # （同一轮 → 还原快照重演；换了窗口 → 新的一次裁剪，结果累积）
+        demo._last_clip_rect = tuple(rect) if rect is not None else None
         msg = getattr(tool, "_msg_text", "") if tool is not None else ""
         # 叠层/注记/红框全部清掉，画面只剩真实裁剪后的图元
         self.canvas.demo.reset()
@@ -1161,9 +1200,10 @@ class DemoView(QWidget):
         if self._is_clip_page():
             # 裁剪页：原图推迟到第 0 步落地时再隐藏（同帧换色，无空白帧）；
             # 若上一轮已真实裁剪，先还原快照，从完整原图重演
+            # （这是"重播同一轮动画"，force=True：必须还原到本轮之前）
             if not self.player.is_playing and \
                     self.player.index >= len(self.player.steps) - 1:
-                self._restore_clip_result()
+                self._restore_clip_result(force=True)
         else:
             self._rehide_for_replay()
         self.player.toggle()
@@ -1182,7 +1222,9 @@ class DemoView(QWidget):
             return
         if self._is_clip_page():
             # 重播前还原上一轮真实裁剪（快照），动画从完整原图重新开始
-            self._restore_clip_result()
+            # （重播的是同一轮动画 → 强制还原；换窗口走的是 _regenerate，
+            #  由它按"窗口是否变化"决定还原还是累积）
+            self._restore_clip_result(force=True)
         else:
             self._rehide_for_replay()
         self.player.replay()
