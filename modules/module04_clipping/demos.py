@@ -8,12 +8,14 @@
 每页 = 参数卡（窗口四边）+ 公式卡 + 决策项监视 + 播放控制，
 步骤流来自 algorithms/* 的 *_steps()（与真实裁剪函数共用同一套判定）。
 
-演示对象 = 画布上选中（或最后画的）图元：
-  · 直线 → 一条线段；
-  · 多边形 → 各条边；
+演示对象 = 画布上选中（或最后画的）图元，动画沿它的【边界逐段遍历】，
+每段跑一遍本页算法、当场判定在不在窗口里，落在窗口内的部分被挖掉：
+  · 直线 → 一条线段（完整看一次判定过程）；
+  · 多边形 → 各条边（逐边 Bresenham 像素与 rasterize 轮廓完全一致，
+    判定轨迹与原图逐像素重合——用户反馈："画出来的轨迹和原来的轨迹
+    不一样，像是两种画法"）；
   · 圆 / 椭圆 → 取图元真实栅格轮廓像素，按绕中心极角排成有序点列，
-    相邻点连成微段——判定轨迹与原图像素逐一重合（用户反馈：
-    "画出来的轨迹和原来的轨迹不一样，像是两种画法"）。
+    每 5~6 个相邻像素切一段（段首尾连成直线，轨迹贴着原轮廓）。
 画布上没有可用图元时只提示，不生成任何内置示例。
 演示页不对画布手绘图元做回放（freehand_replay=False）。
 =====================================================================
@@ -219,6 +221,25 @@ class _ClipDemoBase:
         return ("画布上没有图元：先画直线、圆、椭圆或多边形，"
                 "播放即演示它的裁剪")
 
+    def cut_fill_pixels(self, rect):
+        """窗口【内】的填充像素（轮廓除外）——随轮廓一起被挖除。
+
+        真实裁剪擦掉的是"轮廓∪填充"中落在窗口内的部分；轮廓被挖穿时，
+        窗口内被轮廓围住的填充也一并消失（否则填满的图元会在窗口里
+        留下一个洞，与画布真实裁剪对不上）。
+        """
+        from core.rasterizer import rasterize
+        src = self._pinned_source if self._pinned_source is not None \
+            else self.playback_source()
+        if src is None:
+            return set()
+        outline, fill = rasterize(src)
+        edge = {(int(x), int(y)) for x, y in outline}
+        x0, y0, x1, y1 = rect
+        return {(int(x), int(y)) for x, y in fill
+                if (int(x), int(y)) not in edge
+                and x0 <= x <= x1 and y0 <= y <= y1}
+
     # ---- 页面联动：选中本页即切到裁剪工具 ----
     def tool_selector(self, canvas):
         """演示画布上的裁剪工具：拖窗口 → 回填右侧窗口参数 → 播放。
@@ -269,6 +290,11 @@ class _LineClipDemo(_ClipDemoBase):
     # 子类用具体裁剪函数做"被裁部分"参照（与步骤流同源）
     _clip_fn = None
 
+    # 圆/椭圆：每段包含多少个轮廓像素。太小（1~2 px）→ 每段一步就收敛，
+    # 看不出求交/二分/参数收窄，三页看起来几乎一样；太大 → 一段横跨
+    # 大半个图形，看不出是"沿边界一段段走"。5~6 像素两头都占。
+    _PIECE_LEN = 6
+
     def reference_pixels(self):
         """窗口内的图元像素（橙色参照层 = 将被裁掉的部分）。
 
@@ -291,53 +317,6 @@ class _LineClipDemo(_ClipDemoBase):
         return (min(p["wx0"], p["wx1"]), min(p["wy0"], p["wy1"]),
                 max(p["wx0"], p["wx1"]), max(p["wy0"], p["wy1"]))
 
-    def _demo_chord(self, rect):
-        """封闭图形 → 穿过窗口的一条"长弦"（演示线段）。
-
-        线段裁剪算法（Cohen / 中点 / Liang）演示的是一条线段；把圆/椭圆/
-        多边形拆成 80 条 1~2 像素微段逐段判定时，每段都一次收敛，看不到
-        二分交替、逐轮求交、参数区间收窄，三页看起来几乎一样（用户反馈）。
-        这里取轮廓在窗口纵向范围内跨度最大的一行，作为演示线段。
-        """
-        from core.rasterizer import rasterize
-        src = self.playback_source()
-        if src is None:
-            return None
-        outline, _fill = rasterize(src)
-        rows = {}
-        for x, y in outline:
-            rows.setdefault(int(y), []).append(int(x))
-        if not rows:
-            return None
-        x0, x1 = rect[0], rect[2]
-        y0, y1 = rect[1], rect[3]
-        cand = {y: xs for y, xs in rows.items() if y0 <= y <= y1} or rows
-
-        def score(yy):
-            """先要让线段真的穿过窗口（窗内重叠最长），再看整条弦够不够长。"""
-            xs = cand[yy]
-            lo, hi = min(xs), max(xs)
-            inner = max(0, min(hi, x1) - max(lo, x0))
-            return (inner, hi - lo)
-
-        y = max(cand, key=score)
-        xs = cand[y]
-        a, b = (min(xs), y), (max(xs), y)
-        if a == b:
-            return None
-        return a, b
-
-    def _chord(self):
-        """演示线段：直线就用它本身；封闭图形取水平长弦。"""
-        src = self.playback_source()
-        if src is None:
-            return None
-        from core.shapes import LineShape
-        if isinstance(src, LineShape):
-            return ((int(src.p0[0]), int(src.p0[1])),
-                    (int(src.p1[0]), int(src.p1[1])))
-        return self._demo_chord(self._rect(self.collect()))
-
     def kept_fill_pixels(self, rect):
         """窗口外的填充像素：线段本身没有填充区，但封闭图形有。
 
@@ -359,83 +338,160 @@ class _LineClipDemo(_ClipDemoBase):
         return min(px, key=key), max(px, key=key)
 
     def _segments(self):
-        """演示对象 → 待裁剪线段列表（本页恒为 1 段）。
+        """演示对象 → 沿图形边界【逐段遍历】的待裁剪线段。
 
-        直线 = 它本身；圆/椭圆/多边形 = 穿过窗口的水平长弦——单段才能
-        完整看到每个算法的判定过程（用户确认的方案）。
+        返回 [(起点, 终点, 本段拥有的轮廓像素), ...]：
+          · 直线   → 它本身（1 段，完整看一次判定过程）；
+          · 多边形 → 各条边（顶点 i → i+1）。逐边 Bresenham 的像素与
+            rasterize 的多边形轮廓完全一致 ⇒ 判定轨迹与原图逐像素重合
+            （用户反馈："画出来的轨迹和原来的轨迹不一样，像是两种画法"）；
+          · 圆/椭圆 → 取图元真实栅格轮廓像素，按绕中心极角排成有序点列，
+            每 _PIECE_LEN 个相邻像素切一段（段首尾连成直线）：轨迹贴着
+            原轮廓（不用参数方程重采样——那是另一套像素，两种画法会脱节），
+            每段又有几像素长——跨窗口边时能看清求交 / 二分 / 参数收窄
+            （1~2 像素的微段每段一步就收敛，三页看起来几乎一样，用户反馈）。
         """
-        seg = self._chord()
-        return [seg] if seg else []
+        from algorithms.line_bresenham import bresenham_line
+        from core.shapes import LineShape, PolygonShape
+        src = self.playback_source()
+        if src is None:
+            return []
+        if isinstance(src, LineShape):
+            a = (int(src.p0[0]), int(src.p0[1]))
+            b = (int(src.p1[0]), int(src.p1[1]))
+            owned = {(int(x), int(y))
+                     for x, y in bresenham_line(a[0], a[1], b[0], b[1])}
+            return [(a, b, owned)]
+        if isinstance(src, PolygonShape):
+            pts = [(int(x), int(y)) for x, y in src.vertices]
+            out = []
+            for i in range(len(pts)):
+                a = pts[i]
+                b = pts[(i + 1) % len(pts)]
+                if a == b:
+                    continue
+                owned = {(int(x), int(y))
+                         for x, y in bresenham_line(a[0], a[1], b[0], b[1])}
+                out.append((a, b, owned))
+            return out
+        # 圆 / 椭圆：真实栅格轮廓 → 极角有序点列 → 每 N 个切一段
+        pts = _outline_pixels_sorted(src)
+        n = len(pts)
+        if n < 2:
+            return []
+        out = []
+        step = max(2, self._PIECE_LEN)
+        i = 0
+        while i < n:
+            j = min(i + step, n)              # 本段覆盖 pts[i .. j-1]
+            a, b = pts[i], pts[j - 1]
+            if a != b:
+                owned = {(int(x), int(y)) for x, y in pts[i:j]}
+                out.append((a, b, owned))
+            i = j
+        return out
 
-    def _prelude_steps(self, a, b, rect, full_px=None):
+    def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
         """判定动画的铺垫步骤（区域划分/端点判定等）；子类按需覆盖。
 
-        a, b = 演示线段的两个端点；full_px = 该线段的完整像素
-        （铺垫步在它上面叠加注记）。铺垫只加一次。
+        a, b = 第一段的两个端点；multi = 逐段遍历（端点编码交给各段
+        自己的步骤，逐段遍历时先前的端点标签会叠在一起）；
+        full_px = 完整图形像素（铺垫步在它上面叠加注记）。铺垫只加一次。
         """
         return []
 
     def make_steps(self, params):
+        """步骤流：沿图形边界逐段走，每段跑一遍本页算法并当场判定。
+
+        画面语义（固定三色，全模块统一）：
+          蓝 = 还没被判定挖除的图元像素（窗口外最终留下的就是它）；
+          橙 = 窗口内将被挖除的部分（reference_pixels 橙色参照层，
+                随判定逐段露出来）；
+          紫线 = 算法当前正在判定的那一段（本轮的工作线段）。
+        每段判定完成的瞬间，落在窗口内的像素被挖掉——动画就是在原图
+        基础上一步步裁掉窗口内的部分（用户反馈：要在原图基础上修改）。
+        末帧 = 画布真实裁剪结果（"演完即所得"，播完那一瞬不跳变）。
+        """
         self._pinned_source = self.playback_source()
-        segs = self._segments()
-        if not segs:
+        pieces = self._segments()
+        if not pieces:
             return []
         rect = self._rect(params)
-        a, b = segs[0]          # 本页恒为单段（直线本身 / 封闭图形的水平长弦）
-        from algorithms.line_bresenham import bresenham_line
-        # 演示线段的完整像素：铺垫步（区域划分/端点编码）在它上面叠加注记，
-        # 紫色"当前线段"注记也按它定位两端
-        full_px = set(bresenham_line(a[0], a[1], b[0], b[1]))
-        prelude = self._prelude_steps(a, b, rect, full_px)
-        # 封闭图形：动画演示的是"水平长弦"，第一步先把它说清楚
-        from core.shapes import LineShape
-        _src = self.playback_source()
-        if prelude and _src is not None and not isinstance(_src, LineShape):
-            prelude[0].note = (f"演示线段 = 图形的水平长弦 "
-                               f"{a}→{b} · " + prelude[0].note)
-        # ---- 像素层口径 = 真实主体（与多边形裁剪页、画布真实裁剪一致）----
-        #   蓝 = 窗口外保留（真实图元像素 ∩ 窗口外）
-        #   橙 = 窗口内待挖除（真实图元像素 ∩ 窗口内，橙色参照层）
-        #   紫线 = 算法当前的工作线段（本轮判定的区间）
-        #
-        # 早期版本把 all_pixels() 改写成"演示长弦的像素"，于是封闭图形时
-        # 像素层、橙色参照层、末帧全都按长弦算：橙色标的是一条水平线
-        # （真实裁剪删的却是图形轮廓），末帧还多出长弦那一截——动画跟
-        # 真实裁剪对不上（用户反馈"裁剪动画有问题"）。本页演示的是
-        # "判定过程"，被裁的主体必须始终是真实图元。
-        outside = set(self.kept_pixels(rect))
-        # 轮廓用主色、填充用淡色（Step.tint）：否则边框和填充同色，
-        # 分不清图形边界在哪（用户反馈）
-        fill_list = sorted(self.kept_fill_pixels(rect))
-        steps = prelude + self._steps(a[0], a[1], b[0], b[1], rect)
+        total = len(pieces)
+        multi = total > 1
+        x0, y0, x1, y1 = rect
+
+        def inside(p):
+            """窗口内？（与 ClipTool.apply_crop 的闭区间判定一致）"""
+            return x0 <= p[0] <= x1 and y0 <= p[1] <= y1
+
+        # 起始状态 = 图元真实像素（轮廓 + 填充）
+        current = set(self.all_pixels(rect))
+        fill_now = set(self.kept_fill_pixels(rect))      # 窗口外填充（淡色）
+        fill_in = self.cut_fill_pixels(rect)             # 窗口内填充（待挖除）
+
         from algorithms.steps import (GUIDE_MOVE, Step, line_guide, rect_guide)
-        # 不再把"被算法裁掉的尾巴"褪色或回填：那些尾巴正是窗口外
-        # 要保留的部分，末帧若反转恢复会造成"整段结果前后矛盾"。
-        for st in steps:
-            cur = sorted({(int(p[0]), int(p[1])) for p in st.pixels})
-            if len(cur) >= 2:
-                lo, hi = self._seg_ends(cur, a, b)
-                # 虚线而非实线：当前线段与演示弦共线，实线会把底下
-                # "橙色=待挖除"整段盖掉；虚线能让两层同时可辨。
-                st.guides = list(st.guides) + [
-                    line_guide(lo, hi, GUIDE_MOVE, dash=True, width=2.6)]
-            st.pixels = sorted(outside)
-            st.tint = fill_list
-        if not steps:
-            return steps
-        steps[0].note = (steps[0].note
-                         + "（蓝=保留 · 橙=待挖除 · 紫线=当前线段）")
-        # 末帧必须等于画布真实裁剪结果（双出口契约 + "演完即所得"）：
-        # 窗口内部分被挖掉（橙色参照层同步清除），只留窗口外的真实像素。
+        steps = []
+
+        # ---- 铺垫：9 区划分 / 边界说明，只讲一次 ----
+        first_a, first_b, _owned = pieces[0]
+        prelude = self._prelude_steps(first_a, first_b, rect, multi,
+                                      set(self.all_pixels(rect)))
+        for st in prelude:
+            st.guides = list(st.guides) + [
+                line_guide(first_a, first_b, GUIDE_MOVE, dash=True, width=2.6)]
+            st.pixels = sorted(current)
+            st.tint = sorted(fill_now)
+            steps.append(st)
+
+        # ---- 逐段遍历：每段跑一遍本页算法，判定完就挖掉窗口内部分 ----
+        for i, (a, b, owned) in enumerate(pieces):
+            part = self._steps(a[0], a[1], b[0], b[1], rect)
+            if not part:
+                continue
+            cut = {p for p in owned if inside(p)}
+            for k, st in enumerate(part):
+                cur = sorted({(int(p[0]), int(p[1])) for p in st.pixels})
+                if len(cur) >= 2:
+                    lo, hi = self._seg_ends(cur, a, b)
+                    # 虚线而非实线：当前线段与原轮廓共线，实线会把底下
+                    # "橙色=待挖除"整段盖掉；虚线能让两层同时可辨。
+                    st.guides = list(st.guides) + [
+                        line_guide(lo, hi, GUIDE_MOVE, dash=True, width=2.6)]
+                if k == len(part) - 1 and cut:
+                    # 本段判定完成 → 落在窗口内的部分被挖除；
+                    # 窗口内被轮廓围住的填充也随之消失（否则填满的
+                    # 图元会在窗口里留下一个洞，与画布真实裁剪对不上）
+                    current -= cut
+                    current -= fill_in
+                    fill_now -= fill_in
+                st.pixels = sorted(current)
+                st.tint = sorted(fill_now)
+                if multi:
+                    st.note = f"第 {i + 1}/{total} 段 · {st.note}"
+                if k == len(part) - 1:
+                    if len(cut) == len(owned):
+                        st.note += "（整段在窗口内，已挖除）"
+                    elif cut:
+                        st.note += "（段内落在窗口的部分已挖除）"
+                    else:
+                        st.note += "（本段在窗口外，保留）"
+                if multi:
+                    st.values = {**st.values, "段": f"{i + 1}/{total}"}
+            steps.extend(part)
+
+        # ---- 末帧 = 画布真实裁剪结果（窗口外保留） ----
         # 无论上一帧像素是否已相同都补一帧"完成"：算法末步仍带着
         # 紫色"当前线段"注记，不补的话定格画面会残留一条线，
         # 看着像窗口内那段没被裁掉。
-        vals = dict(steps[-1].values)
+        current -= fill_in
+        fill_now -= fill_in
+        vals = dict(steps[-1].values) if steps else {}
         vals["判定"] = "完成"
         steps.append(Step(
-            sorted(outside), vals,
+            sorted(current), vals,
             "裁剪完成：窗口内部分已挖除，只保留窗口外",
-            guides=[rect_guide(rect)], tint=fill_list))
+            guides=[rect_guide(rect)], tint=sorted(fill_now)))
         return steps
 
 
@@ -464,10 +520,12 @@ class CohenDemo(_LineClipDemo):
 
     _clip_fn = staticmethod(cohen_sutherland)
 
-    def _prelude_steps(self, a, b, rect, full_px=None):
+    def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
         """判定铺垫：① 窗口四边延长成 9 区逐区标码；②③ 端点逐个判区编码。
 
-        铺垫步像素 = 完整演示线段：动画从它出发，在它上面叠加判定注记。
+        逐段遍历（multi）时只做区域划分：端点编码交给各段自己的步骤——
+        对"第一段"预先编码既与窗口无关，相邻端点的标签还会叠在一起。
+        铺垫步像素 = 完整图形：动画从原图出发，在它上面叠加判定注记。
         """
         import math
         from algorithms.line_bresenham import bresenham_line
@@ -502,6 +560,8 @@ class CohenDemo(_LineClipDemo):
                       "窗口四条边向外延长 → 平面分成 9 个区域，"
                       "每区一个 4 位区域码（D3D2D1D0 = 下上右左）",
                       guides=guides)]
+        if multi:
+            return steps
         seg_px = sorted(set(bresenham_line(a[0], a[1], b[0], b[1])))
         marks = []
         for tag, p, kc, ke in (("起点", a, "区域码0", "端点0"),
@@ -643,7 +703,7 @@ class LiangDemo(_LineClipDemo):
 
     _clip_fn = staticmethod(liang_barsky)
 
-    def _prelude_steps(self, a, b, rect, full_px=None):
+    def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
         """判定铺垫：标出四条边界与初始参数区间，再逐边界判 p·t ≤ q。"""
         from algorithms.line_bresenham import bresenham_line
         from algorithms.steps import Step, label_guide, rect_guide

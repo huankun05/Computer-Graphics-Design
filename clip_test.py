@@ -151,6 +151,17 @@ def check_case(page_name, demo_cls, is_line_page, sname, make_shape):
                 seq.append(cur)
         ok(len(seq) >= 2, f"{tag}: 紫色当前线段全程未变化（动画不动）")
 
+    # ---- C5：逐段遍历（封闭图形必须真的沿边界一段段走）----
+    sizes = [len(st.pixels) for st in steps]
+    ok(all(sizes[i] >= sizes[i + 1] for i in range(len(sizes) - 1)),
+       f"{tag}: 像素层不是单调递减（挖除过程不是渐进的）{sizes}")
+    if is_line_page and sname != "直线":
+        segs = demo._segments()
+        ok(len(segs) > 1,
+           f"{tag}: 未沿边界逐段遍历（只有 {len(segs)} 段，应为多段）")
+        ok(any("段" in st.note for st in steps),
+           f"{tag}: 步骤未标注第几段")
+
 
 print("=" * 64)
 print("模块四裁剪演示：动画口径 vs 真实裁剪")
