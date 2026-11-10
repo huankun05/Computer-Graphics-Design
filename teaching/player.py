@@ -16,6 +16,12 @@
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+# 播放速度范围（步/秒）。
+# 下限取 0.1：一步 10 秒——判定/求交这类演算步骤有时必须逐帧盯着看，
+# 整数档（最低 1 步/秒）仍嫌快（用户反馈："在最低速度下感觉都比较快"）。
+MIN_FPS = 0.1
+MAX_FPS = 240.0
+
 
 class DemoPlayer(QObject):
     """步骤流播放器：QTimer 驱动的索引推进器。"""
@@ -28,7 +34,7 @@ class DemoPlayer(QObject):
         super().__init__(parent)
         self.steps = []
         self.index = -1                 # -1 = 尚未开始
-        self.fps = 30                   # 步/秒（默认放慢，单步演算看得清）
+        self.fps = 30.0                 # 步/秒（默认放慢，单步演算看得清）
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
@@ -44,7 +50,7 @@ class DemoPlayer(QObject):
             return
         if self.index >= len(self.steps) - 1:
             self._set_index(0)          # 播到底再按 = 从头播放
-        self._timer.start(max(1, int(1000 / self.fps)))
+        self._timer.start(self._interval())
         self.state_changed.emit(True)
 
     def pause(self):
@@ -78,10 +84,18 @@ class DemoPlayer(QObject):
         self.pause()
         self._set_index(len(self.steps) - 1)
 
-    def set_fps(self, fps: int):
-        self.fps = max(1, int(fps))
+    def set_fps(self, fps):
+        """设置播放速度（步/秒）。支持小数：0.1 步/秒 = 每步 10 秒。"""
+        self.fps = max(MIN_FPS, min(MAX_FPS, float(fps)))
         if self._timer.isActive():      # 播放中调速立即生效
-            self._timer.start(max(1, int(1000 / self.fps)))
+            self._timer.start(self._interval())
+
+    def _interval(self) -> int:
+        """一步的间隔毫秒数。
+
+        最小 10ms：速度再高也不能把事件循环打爆（0 间隔会卡死界面）。
+        """
+        return max(10, int(round(1000.0 / max(self.fps, MIN_FPS))))
 
     @property
     def is_playing(self) -> bool:

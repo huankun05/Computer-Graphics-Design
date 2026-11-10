@@ -598,6 +598,23 @@ demo_view._on_page_button(gd_page, demo_view._page_buttons[gd_page])
 app.processEvents()
 expect(demo_view._stage.currentIndex() == 0, "切回画布页：舞台恢复画布")
 
+# 7.3b 播放速度：滑杆要能调到 1 步/秒以下（判定步骤必须逐帧看得清）
+from teaching.player import MAX_FPS, MIN_FPS
+_sld = demo_view.speed_slider
+expect(_sld.minimum() / 10.0 <= MIN_FPS + 1e-9
+       and _sld.maximum() / 10.0 >= MAX_FPS - 1e-9,
+       f"速度滑杆范围 {_sld.minimum() / 10:g}~{_sld.maximum() / 10:g} 步/秒"
+       f"（须覆盖 {MIN_FPS:g}~{MAX_FPS:g}）")
+_sld.setValue(5)                 # 0.5 步/秒
+app.processEvents()
+expect(abs(demo_view.player.fps - 0.5) < 1e-9
+       and demo_view.player._interval() == 2000,
+       "慢速档 0.5 步/秒 = 每步 2000ms")
+expect("0.5" in demo_view.speed_lab.text(),
+       f"速度标签显示小数档（当前 '{demo_view.speed_lab.text()}'）")
+_sld.setValue(int(30 * 10))
+app.processEvents()
+
 # 7.3c 零动画原则：点击演示页不生成不播放；点播放 = 按当前参数生成并播
 expect(len(demo_view.player.steps) == 0 and not demo_view.player.is_playing,
        "点击演示页零动画（装载参数卡，不生成不播放）")

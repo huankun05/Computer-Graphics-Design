@@ -411,6 +411,18 @@ print("-" * 64)
 print("画布填充色：必须与演示层主色区分开")
 check_canvas_fill_contrast()
 
+print("-" * 64)
+print("播放速度：裁剪页必须够慢（逐帧看得清判定过程）")
+for _page_name, _demo_cls, _is_line in PAGES:
+    _fps = getattr(_demo_cls, "default_fps", 30)
+    ok(_fps <= 1.0 + 1e-9,
+       f"{_page_name}: 默认速度 {_fps:g} 步/秒 > 1（判定过程看不清，"
+       f"用户反馈\"在最低速度下感觉都比较快\"）")
+from teaching.player import MAX_FPS, MIN_FPS  # noqa: E402
+ok(MIN_FPS <= 0.1 + 1e-9,
+   f"播放器最慢档 {MIN_FPS:g} 步/秒（应 ≤0.1，即一步 10 秒）")
+ok(MAX_FPS >= 240 - 1e-9, f"播放器最快档 {MAX_FPS:g} 步/秒（应 ≥240）")
+
 print("=" * 64)
 if FAIL:
     print(f"clip_test: FAIL ✗（{len(FAIL)} 项未通过，共 {PASS + len(FAIL)} 项）")

@@ -543,7 +543,10 @@ class CohenDemo(_LineClipDemo):
                  "判定": "判定", "使用边界": "本轮用的窗口边",
                  "端点0": "起点", "端点1": "终点",
                  "交点": "新交点"}
-    default_fps = 2
+    # 判定过程要逐帧盯着看：每一步都在算求交 / 二分 / 参数收窄，
+    # 2 步/秒仍嫌快（用户反馈："在最低速度下感觉都比较快"）→ 默认 1 步/秒；
+    # 速度滑杆还能继续调慢到 0.1 步/秒（一步 10 秒）
+    default_fps = 1
     formula = ("Cohen-Sutherland 编码裁剪\n"
                "区域码 4 位 D3 D2 D1 D0\n"
                "  D3 下 1000    D2 上 0100\n"
@@ -726,7 +729,10 @@ class LiangDemo(_LineClipDemo):
     algo = ALGO_LIANG
     variables = {"阶段": "阶段", "边界": "当前边界",
                  "p": "p", "q": "q", "u0": "u0", "u1": "u1"}
-    default_fps = 2
+    # 判定过程要逐帧盯着看：每一步都在算求交 / 二分 / 参数收窄，
+    # 2 步/秒仍嫌快（用户反馈："在最低速度下感觉都比较快"）→ 默认 1 步/秒；
+    # 速度滑杆还能继续调慢到 0.1 步/秒（一步 10 秒）
+    default_fps = 1
     formula = ("Liang-Barsky 参数裁剪\n"
                "P(t) = P0 + t·d，t ∈ [0, 1]\n"
                "四条边界依次判 p·t ≤ q：\n"
@@ -776,7 +782,10 @@ class PolygonClipDemo(_ClipDemoBase):
     icon = "polygon"
     algo = ALGO_HODGMAN
     subject_kind = "closed"       # 演示对象 = 画布上选中/最后画的封闭图形
-    default_fps = 2
+    # 判定过程要逐帧盯着看：每一步都在算求交 / 二分 / 参数收窄，
+    # 2 步/秒仍嫌快（用户反馈："在最低速度下感觉都比较快"）→ 默认 1 步/秒；
+    # 速度滑杆还能继续调慢到 0.1 步/秒（一步 10 秒）
+    default_fps = 1
     variables = {"阶段": "当前边", "轮次": "第几轮", "边界": "本轮用的边",
                  "输入顶点": "输入", "输出顶点": "输出",
                  "新增交点": "新交点", "情形": "S→E 情形",

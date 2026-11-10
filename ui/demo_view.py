@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 import html as _html
 
 from core.registry import all_modules
-from teaching.player import DemoPlayer
+from teaching.player import MAX_FPS, MIN_FPS, DemoPlayer
 from teaching.monitor import MonitorPanel, MatrixView
 from ui import theme
 from ui.icons import icon
@@ -427,11 +427,12 @@ class DemoView(QWidget):
         slabel.setObjectName("secondary")
         srow.addWidget(slabel)
         self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(1, 240)
-        self.speed_slider.setValue(30)
-        self.speed_slider.valueChanged.connect(
-            lambda v: (self.player.set_fps(v),
-                       self.speed_lab.setText(f"{v} 步/秒")))
+        # 滑杆按 ×10 刻度：最小 0.1 步/秒（一步 10 秒）。
+        # 判定/求交这类步骤必须逐帧盯着看，整数档（最低 1 步/秒）仍嫌快
+        # （用户反馈："在最低速度下感觉都比较快"）。
+        self.speed_slider.setRange(int(MIN_FPS * 10), int(MAX_FPS * 10))
+        self.speed_slider.setValue(int(30 * 10))
+        self.speed_slider.valueChanged.connect(self._on_speed_changed)
         srow.addWidget(self.speed_slider, stretch=1)
         self.speed_lab = QLabel("30 步/秒")
         self.speed_lab.setObjectName("mono")
@@ -556,7 +557,9 @@ class DemoView(QWidget):
         # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢
         self.canvas.demo.set_accumulate(getattr(demo, "trails", True))
         if hasattr(self, "speed_slider"):
-            self.speed_slider.setValue(int(getattr(demo, "default_fps", 30)))
+            # 各页默认速度按页给（裁剪页慢放），统一走 ×10 的滑杆刻度
+            self.speed_slider.setValue(
+                int(round(getattr(demo, "default_fps", 30) * 10)))
         skip = getattr(self, "_skip_next_regen", False)
         self._skip_next_regen = False
         if regenerate and not skip:
@@ -658,6 +661,16 @@ class DemoView(QWidget):
             self.progress_label.setText(
                 "在已有边界内部点击填充（算法随上方下拉）" if has_boundary
                 else "先用「多边形」页画边界，再回本页点击内部填充")
+
+    def _on_speed_changed(self, raw: int):
+        """速度滑杆 → 播放速度。
+
+        raw 是 ×10 的刻度（滑杆最小 10 = 0.1 步/秒 = 一步 10 秒）。
+        标签用 :g 输出：整数档显示 "30 步/秒"，慢速档显示 "0.5 步/秒"。
+        """
+        fps = raw / 10.0
+        self.player.set_fps(fps)
+        self.speed_lab.setText(f"{fps:g} 步/秒")
 
     def _restore_replay_shapes(self):
         """恢复被回放隐藏的图元显示并重画底图（幂等）。"""
