@@ -50,8 +50,8 @@ from core.canvas_view import CanvasView  # noqa: E402
 from core.rasterizer import rasterize  # noqa: E402
 from core.shapes import (IMAGE_H, IMAGE_W, KIND_CIRCLE_MID,  # noqa: E402
                          KIND_ELLIPSE, KIND_LINE_BRESENHAM, KIND_POLYGON,
-                         CircleShape, EllipseShape, LineShape, PolygonShape,
-                         SIM)
+                         KIND_RASTER_FILL, CircleShape, EllipseShape,
+                         LineShape, PolygonShape, RasterFillShape, SIM)
 from modules.module04_clipping.demos import (CohenDemo, LiangDemo,  # noqa: E402
                                             MidpointDemo, PolygonClipDemo)
 from modules.module04_clipping.tools import ClipTool  # noqa: E402
@@ -329,6 +329,64 @@ def check_accumulate():
     _app.processEvents()
 
 
+def check_canvas_fill_contrast():
+    """C9：演示画布的【图元填充色】必须与演示层主色区分开。
+
+    真实缺陷（用户截图）：演示画布的 fill_color 就是主题蓝，而演示层用
+    主题蓝画被演示图元的轮廓 → 油漆桶填出来的内部和轮廓是同一个蓝，
+    边框彻底看不见（"边界和填充一个颜色了，展示不出来"）。
+    这里既查配置，也查【渲染实况】：桶填充的内部与演示层轮廓必须不同色。
+    """
+    from ui.demo_view import DemoView
+    dv = DemoView()
+    cv = dv.canvas
+    fill = getattr(cv, "fill_color", None)
+    ok(fill is not None and QColor(fill).name() != QColor(ACCENT).name(),
+       f"演示画布填充色 {fill} 与演示层主色 {ACCENT} 相同（边框会被填充吃掉）")
+
+    ell = EllipseShape(kind=KIND_ELLIPSE, color=QColor("#222222"), fill=False,
+                       center=(28, 20), rx=16, ry=9)
+    filled = EllipseShape(kind=KIND_ELLIPSE, color=QColor("#222222"), fill=True,
+                          center=(28, 20), rx=16, ry=9)
+    o, f = rasterize(filled)
+    edge = {(int(x), int(y)) for x, y in o}
+    interior = {(int(x), int(y)) for x, y in f} - edge
+    bucket = RasterFillShape(kind=KIND_RASTER_FILL, color=QColor(fill),
+                             width=1, seed=(28, 20),
+                             pixels=sorted(interior), owner=ell)
+    cv.document.shapes.append(ell)
+    cv.document.shapes.append(bucket)
+    cv._render_base()
+    demo = CohenDemo()
+    demo._canvas = cv
+    demo._spins = {}
+    steps = demo.make_steps(demo.collect())
+    ok(bool(steps), "桶填充场景未生成步骤流")
+    if not steps:
+        return
+    cv.demo.set_accumulate(getattr(demo, "trails", True))
+    cv.demo.advance(steps[0], steps[0].values.get("color", ACCENT))
+    # 像素层（演示层画的轮廓）与底图（画布画的桶填充）分别取样
+    img = QImage(IMAGE_W, IMAGE_H, QImage.Format_RGB32)
+    img.fill(QColor("#FFFFFF"))
+    p = QPainter(img)
+    cv.demo.paint(p)
+    p.end()
+    ox, oy = cv._base_origin
+    rim_px = sorted(edge)[0]
+    inner_px = sorted(interior)[0]
+    c_rim = img.pixelColor(rim_px[0] * SIM + SIM // 2,
+                           rim_px[1] * SIM + SIM // 2)
+    c_inner = cv.base_image.pixelColor(inner_px[0] * SIM - ox * SIM + SIM // 2,
+                                       inner_px[1] * SIM - oy * SIM + SIM // 2)
+    ok(c_rim != c_inner,
+       f"演示层轮廓色 {c_rim.name()} 与画布填充色 {c_inner.name()} 相同"
+       f"（边框展示不出来）")
+    dv.close()
+    dv.deleteLater()
+    _app.processEvents()
+
+
 print("=" * 64)
 print("模块四裁剪演示：动画口径 vs 真实裁剪")
 for page_name, demo_cls, is_line_page in PAGES:
@@ -348,6 +406,10 @@ for page_name, demo_cls, is_line_page in PAGES:
 print("-" * 64)
 print("累积：同一个图元上连续裁两次")
 check_accumulate()
+
+print("-" * 64)
+print("画布填充色：必须与演示层主色区分开")
+check_canvas_fill_contrast()
 
 print("=" * 64)
 if FAIL:

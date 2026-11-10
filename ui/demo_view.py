@@ -137,8 +137,12 @@ class DemoView(QWidget):
         # 演示画布手绘图元一律描边：算法演示只看轮廓像素，
         # 实心填充会把要演示的算法像素盖住（填充是独立的操作）
         self.canvas.fill_mode = False
-        # 演示模式无法换颜色：填充固定用主题蓝，与黑色边界明显区分
-        self.canvas.fill_color = theme.ACCENT
+        # 演示画布上"填充"用中性灰：必须与演示层主色（主题蓝）区分开，
+        # 否则油漆桶填出来的内部和演示层画的轮廓是同一个蓝——
+        # 轮廓被填充整个吃掉，边框彻底看不见（用户反馈："边框和填充
+        # 弄成一个颜色了，展示不出来"）。灰色一眼就知道是图元本身，
+        # 不占用任何算法配色语义。
+        self.canvas.fill_color = theme.DEMO_FILL
         self.player = DemoPlayer(self)
         self.current_demo = None
         self._replay_shapes = []      # 正在"从无到有"回放的图元（回放中隐藏）

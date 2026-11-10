@@ -41,6 +41,15 @@ CH_H, CH_S, CH_V = "#F76B15", "#8E4EC6", "#687076"
 
 PREVIEW_HEX = "#F76B15"    # 预览像素（橙）
 DEMO_CURRENT = ACCENT       # 演示当前像素
+
+# 演示画布上图元的【填充】色。
+# 必须与演示层主色（ACCENT）明显区分：演示层用主色画被演示图元的轮廓，
+# 画布用这个色画同一图元的内部——两者若是同一个蓝，
+# 油漆桶填出来的内部会把演示的轮廓整个吃掉，边框彻底看不见
+# （用户反馈："边界和填充一个颜色了，展示不出来"）。
+# 选中性灰：一眼就知道"这是图元本身"，不属于任何算法配色语义
+# （蓝=保留 / 橙=待挖除 / 紫=当前线段）。
+DEMO_FILL    = "#8A919F"
 MONO_FONT   = '"Consolas", "Courier New", monospace'
 UI_FONT     = '"Microsoft YaHei UI", "Segoe UI", sans-serif'
 
