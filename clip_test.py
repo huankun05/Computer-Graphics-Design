@@ -51,7 +51,29 @@ from core.rasterizer import rasterize  # noqa: E402
 from core.shapes import (IMAGE_H, IMAGE_W, KIND_CIRCLE_MID,  # noqa: E402
                          KIND_ELLIPSE, KIND_LINE_BRESENHAM, KIND_POLYGON,
                          KIND_RASTER_FILL, CircleShape, EllipseShape,
-                         LineShape, PolygonShape, RasterFillShape, SIM)
+                         LineShape, PolygonShape, RasterFillShape, SIM,
+                         restore, scale_snapshot, snapshot, transform_shape)
+from algorithms import transform2d as tf  # noqa: E402
+from algorithms.window_mask import point_in_polygon  # noqa: E402
+
+
+def _mask_float(vertices):
+    """浮点多边形 → 像素中心落在其中的像素集合（守卫自带，不依赖实现细节）。
+
+    守卫要能在【旧代码】上跑出红色，所以这里不引用实现里的新函数：
+    只用早已存在的 point_in_polygon 自己算一遍"应挖区域"。
+    """
+    import math
+    if len(vertices) < 3:
+        return set()
+    x0 = int(math.floor(min(v[0] for v in vertices)))
+    x1 = int(math.ceil(max(v[0] for v in vertices)))
+    y0 = int(math.floor(min(v[1] for v in vertices)))
+    y1 = int(math.ceil(max(v[1] for v in vertices)))
+    return {(x, y)
+            for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+            if point_in_polygon(vertices, (x, y))}
 from modules.module04_clipping.demos import (CohenDemo, LiangDemo,  # noqa: E402
                                             MidpointDemo, PolygonClipDemo)
 from modules.module04_clipping.tools import ClipTool  # noqa: E402
@@ -387,6 +409,94 @@ def check_canvas_fill_contrast():
     _app.processEvents()
 
 
+def check_transform_after_clip():
+    """C10：图元被区域裁剪挖掉一部分后，再旋转/缩放 → 被挖区域必须仍然是干净的。
+
+    用户反馈（截图）："原本是一个椭圆，裁剪裁到了它的右下方，照理说右下
+    方就全是空白，本来是正确的，但是当我旋转它之后，它右下方就变成了这种
+    样子"（右下方冒出一片黑散点）。
+
+    根因：挖除范围原来只是**旧像素集的点采样**（shape.erased），
+    而图元变换后是**重新光栅化**的（圆/椭圆还按协方差矩阵解析式
+    重参数化）—— 两者不同源：采样点取整映射后漏格，本该被挖掉的像素
+    没被盖住 → 变换后残留一片黑散点。
+    修法：裁剪窗口作为**几何区域**（shape.cuts）随图元一起变换，
+    渲染时按几何重新求交，挖掉的区域始终是连续区域。
+
+    这里走真实路径：ClipTool._apply_all 挖除 → transform_shape 旋转 /
+    scale_snapshot 缩放 → 核对"落在变换后窗口内的像素"必须为 0。
+    """
+    cases = [
+        ("椭圆", EllipseShape(kind=KIND_ELLIPSE, color=QColor("#222222"),
+                              fill=True, center=(30, 20), rx=15, ry=9)),
+        ("多边形", PolygonShape(kind=KIND_POLYGON, fill=True,
+                                color=QColor("#222222"),
+                                vertices=[(14, 10), (44, 12), (40, 30),
+                                          (16, 28)])),
+    ]
+    window = (30, 20, 46, 34)          # 右下角窗口
+    win_poly = [(window[0], window[1]), (window[2], window[1]),
+                (window[2], window[3]), (window[0], window[3])]
+
+    for name, shape in cases:
+        cv = CanvasView()
+        cv.document.shapes.append(shape)
+        cv._render_base()
+
+        # ---- 真实挖除（应用模式 ClipTool） ----
+        tool = ClipTool(cv)
+        tool.rect = window
+        tool.mode = "rect"
+        tool._apply_all()
+        ok(bool(shape.erased),
+           f"{name}：裁剪没有挖掉任何像素")
+        ok(bool(getattr(shape, "cuts", None)),
+           f"{name}：裁剪没有记录几何窗口（cuts 为空）——"
+           f"变换后被挖区域会漏格、残留黑散点")
+
+        def leftovers(acc):
+            """当前画出的像素里，落在【累计变换后的窗口】内的（应为 0）。
+
+            acc = 到目前为止施加在图元上的总变换（后施加的矩阵在左）。
+            """
+            outline, fill = rasterize(shape)
+            drawn = {(int(x), int(y)) for x, y in outline + fill}
+            return drawn & _mask_float(
+                [tf.apply(acc, v) for v in win_poly])
+
+        acc = tf.identity()
+
+        # ---- 旋转 30° ----
+        cx, cy = shape.center if hasattr(shape, "center") else (29, 20)
+        m = tf.around((cx, cy), tf.rotation(30))
+        transform_shape(shape, m)
+        acc = tf.compose(m, acc)
+        left = leftovers(acc)
+        ok(not left,
+           f"{name}：旋转 30° 后，被裁掉的区域又冒出 {len(left)} 个黑散点"
+           f"（样例 {sorted(left)[:5]}）——裁剪窗口没有跟着图元按几何变换")
+
+        # ---- 再旋转 30°（连续变换不能累积误差） ----
+        m2 = tf.around((cx, cy), tf.rotation(30))
+        transform_shape(shape, m2)
+        acc = tf.compose(m2, acc)
+        left2 = leftovers(acc)
+        ok(not left2,
+           f"{name}：连续旋转两次后，被裁掉的区域冒出 {len(left2)} 个黑散点")
+
+        # ---- 缩放（走 scale_snapshot 那条路径） ----
+        snap = snapshot(shape)
+        scaled = scale_snapshot(shape.kind, snap, 1.4, 1.4, anchor=(cx, cy))
+        restore(shape, scaled)
+        ms = tf.around((cx, cy), tf.scaling(1.4, 1.4))
+        acc = tf.compose(ms, acc)
+        left3 = leftovers(acc)
+        ok(not left3,
+           f"{name}：缩放 1.4 倍后，被裁掉的区域冒出 {len(left3)} 个黑散点")
+
+        cv.close()
+
+
 print("=" * 64)
 print("模块四裁剪演示：动画口径 vs 真实裁剪")
 for page_name, demo_cls, is_line_page in PAGES:
@@ -410,6 +520,10 @@ check_accumulate()
 print("-" * 64)
 print("画布填充色：必须与演示层主色区分开")
 check_canvas_fill_contrast()
+
+print("-" * 64)
+print("变换后：被裁掉的区域必须仍然是干净的（不能冒黑散点）")
+check_transform_after_clip()
 
 print("-" * 64)
 print("播放速度：裁剪页必须够慢（逐帧看得清判定过程）")

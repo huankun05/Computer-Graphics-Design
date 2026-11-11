@@ -55,9 +55,11 @@ def _outline_pixels_sorted(shape, ignore_erased: bool = False):
     import math
     from core.rasterizer import rasterize
     src = shape
-    if ignore_erased and getattr(shape, "erased", None):
+    if ignore_erased and (getattr(shape, "erased", None)
+                          or getattr(shape, "cuts", None)):
         src = copy.copy(shape)
         src.erased = set()
+        src.cuts = []          # 裁剪窗口也是几何挖除：取完整轮廓时一并清掉
     outline, _fill = rasterize(src)
     cx, cy = shape.center
     return sorted({(int(x), int(y)) for x, y in outline},

@@ -13,6 +13,7 @@
 =====================================================================
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from PySide6.QtGui import QColor
@@ -55,10 +56,46 @@ def _round_point(p) -> Tuple[int, int]:
     return int(round(p[0])), int(round(p[1]))
 
 
+def _cell_pixels(m: tf.Mat3, x: int, y: int) -> set:
+    """保留：单个被擦像素代表的方块经仿射变换后覆盖哪些像素。
+
+    当前橡皮擦走点映射（掩码必须精确等于被擦掉的像素），此函数暂未被
+    调用；将来若要把橡皮擦也升级成"区域"语义，可直接复用。
+    """
+    from algorithms.window_mask import point_in_polygon
+    corners = [(x - 0.5, y - 0.5), (x + 0.5, y - 0.5),
+               (x + 0.5, y + 0.5), (x - 0.5, y + 0.5)]
+    quad = [tf.apply(m, p) for p in corners]
+    x0 = int(math.floor(min(p[0] for p in quad)))
+    x1 = int(math.ceil(max(p[0] for p in quad)))
+    y0 = int(math.floor(min(p[1] for p in quad)))
+    y1 = int(math.ceil(max(p[1] for p in quad)))
+    out = set()
+    for yy in range(y0, y1 + 1):
+        for xx in range(x0, x1 + 1):
+            if point_in_polygon(quad, (xx, yy)):
+                out.add((xx, yy))
+    return out
+
+
 def _map_erased(shape: "Shape", m: tf.Mat3):
-    """擦除掩码跟随几何一起变换（否则移动后擦除洞会留在原地）。"""
+    """擦除掩码跟随几何一起变换（否则移动后擦除洞会留在原地）。
+
+    ★ 分工（用户反馈："裁剪掉右下角后一旋转，右下角又冒出一片黑散点"）：
+    · 橡皮擦 = **像素级**操作，掩码必须精确等于被擦掉的那些像素，
+      所以这里按像素中心点映射（平移/缩放后逐像素对得上）；
+    · 区域裁剪 = **几何**操作，"挖掉的是窗口这块区域"。窗口若也按点
+      采样推，图元变换后是**重新光栅化**的（圆/椭圆还按协方差矩阵解析式
+      重参数化），两边不同源 → 掩码漏格，本该挖掉的像素没被盖住，
+      变换后就残留一片黑散点。
+      因此裁剪窗口另存为 cuts（多边形），随图元一起变换，渲染时按
+      几何重新求交 —— 区域永远是连续区域，不会漏格。
+    """
     if shape.erased:
         shape.erased = {_round_point(tf.apply(m, p)) for p in shape.erased}
+    if getattr(shape, "cuts", None):
+        shape.cuts = [[tf.apply(m, v) for v in poly]
+                      for poly in shape.cuts]
 
 
 def _replace_circle_with_ellipse(shape: "CircleShape",
@@ -119,7 +156,8 @@ def snapshot(shape: "Shape") -> dict:
     额外记录 __cls__ 与 erased：圆↔椭圆转换、擦除掩码变换后
     撤销/取消都能恢复到变换前的类型与掩码。
     """
-    snap = {"__cls__": type(shape), "erased": set(shape.erased)}
+    snap = {"__cls__": type(shape), "erased": set(shape.erased),
+            "cuts": [list(poly) for poly in getattr(shape, "cuts", [])]}
     if isinstance(shape, LineShape):
         snap.update(p0=shape.p0, p1=shape.p1)
     elif isinstance(shape, CircleShape):
@@ -192,8 +230,13 @@ def scale_snapshot(kind: str, snap: dict, fx: float,
     out = dict(snap)
 
     if "erased" in out:
+        # 橡皮擦是像素级操作：按像素中心点映射（掩码 = 精确的那些像素）
         out["erased"] = {_round_point(tf.apply(m, p))
                          for p in out["erased"]}
+    if out.get("cuts"):
+        # 裁剪窗口是几何区域：顶点随矩阵一起变换（区域语义，不能按点推）
+        out["cuts"] = [[tf.apply(m, v) for v in poly]
+                       for poly in out["cuts"]]
 
     if "r" in out:                                   # 圆
         cx, cy, nrx, nry, ang = tf.ellipse_from_matrix(
@@ -240,6 +283,10 @@ class Shape:
     fill: bool = False                          # 填充模式（闭合形状：圆/椭圆/多边形）
     inset: int = 0                              # 内缩渲染（分层显示用）
     erased: set = field(default_factory=set)    # 橡皮擦擦除掩码（模拟像素坐标集合）
+    # 区域裁剪的"挖除窗口"（世界坐标多边形，顶点可带小数）：
+    # 裁剪是几何操作，窗口随图元一起变换，渲染时按几何重新求交。
+    # 有了它，被裁掉的区域在旋转/缩放后仍是干净的一块，不会残留黑散点。
+    cuts: list = field(default_factory=list)
 
 
 @dataclass

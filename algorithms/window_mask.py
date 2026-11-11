@@ -25,6 +25,8 @@
 
 from typing import List, Set, Tuple
 
+import math
+
 from algorithms.fill_scanline import scanline_fill_steps
 from algorithms.line_bresenham import bresenham_line
 from algorithms.steps import Step, expand_steps
@@ -98,3 +100,28 @@ def point_in_polygon(vertices: List[Pixel], point: Pixel) -> bool:
             if x < xi:
                 inside = not inside
     return inside
+
+
+def polygon_mask_float(vertices: List[Pixel]) -> Set[Pixel]:
+    """**浮点**顶点多边形 → 掩膜像素集合（像素中心在多边形内，含边界）。
+
+    polygon_mask 那一套是给整数顶点准备的（扫描线补边 + Bresenham 补点），
+    窗口被旋转/缩放后顶点带小数，硬取整会让掩膜整体漂半格；这里改用
+    "点包含"判定：像素 (x, y) 的中心就是 (x, y)，落在多边形内即计入。
+
+    用途：图元的裁剪窗口随图元变换后，按几何重新求交 —— 挖掉的区域
+    始终是连续区域，不会因为点采样漏格而残留黑散点。
+    """
+    n = len(vertices)
+    if n < 3:
+        return set()
+    x0 = int(math.floor(min(v[0] for v in vertices)))
+    x1 = int(math.ceil(max(v[0] for v in vertices)))
+    y0 = int(math.floor(min(v[1] for v in vertices)))
+    y1 = int(math.ceil(max(v[1] for v in vertices)))
+    out = set()
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            if point_in_polygon(vertices, (x, y)):
+                out.add((x, y))
+    return out

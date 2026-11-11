@@ -33,14 +33,56 @@ from core.shapes import (
 Pixel = Tuple[int, int]
 
 
+def _cut_mask(shape: Shape) -> frozenset:
+    """图元的几何挖除区域（裁剪窗口）→ 掩膜像素集合。
+
+    ★ 为什么要有这一层（用户反馈："裁剪掉右下角后一旋转，右下角又冒出
+    一片黑散点"）：裁剪是**几何**操作——"挖掉的是窗口这块区域"。
+    图元变换后是重新光栅化的（圆/椭圆还按协方差矩阵解析式重参数化），
+    若挖除范围只是"旧像素集的点采样"，两边就不同源：采样点取整后漏格，
+    本该挖掉的像素没被盖住 → 变换后残留一片黑散点。
+    所以窗口多边形随图元一起变换，渲染时按几何重新求交（区域始终连续）。
+
+    掩膜按 cuts 内容缓存（内容变了缓存自动失效）。
+    """
+    cuts = getattr(shape, "cuts", None)
+    if not cuts:
+        return frozenset()
+    key = tuple(tuple((float(x), float(y)) for x, y in poly) for poly in cuts)
+    cache = getattr(shape, "_cut_cache", None)
+    if cache is not None and cache[0] == key:
+        return cache[1]
+    from algorithms.window_mask import polygon_mask, polygon_mask_float
+    mask = set()
+    for poly in cuts:
+        if all(float(x).is_integer() and float(y).is_integer()
+               for x, y in poly):
+            # 整数顶点：与窗口掩膜同一函数，保证未变换时逐像素一致
+            mask |= polygon_mask([(int(x), int(y)) for x, y in poly])
+        else:
+            # 变换后的浮点顶点：按点包含判定，避免取整漂移
+            mask |= polygon_mask_float(poly)
+    mask = frozenset(mask)
+    try:
+        shape._cut_cache = (key, mask)
+    except AttributeError:          # 极端情况：不允许挂属性就现算
+        pass
+    return mask
+
+
 def _apply_erased(shape: Shape, outline: List[Pixel],
                   fill: List[Pixel]) -> Tuple[List[Pixel], List[Pixel]]:
-    """橡皮擦掩码扣减：被擦除的像素不再输出。"""
+    """擦除掩码 + 裁剪窗口扣减：被擦除/被挖掉的像素不再输出。"""
     erased = getattr(shape, "erased", None)
-    if not erased:
+    cut = _cut_mask(shape)
+    if not erased and not cut:
         return outline, fill
-    outline = [p for p in outline if p not in erased]
-    fill = [p for p in fill if p not in erased]
+    if erased:
+        outline = [p for p in outline if p not in erased]
+        fill = [p for p in fill if p not in erased]
+    if cut:
+        outline = [p for p in outline if p not in cut]
+        fill = [p for p in fill if p not in cut]
     return outline, fill
 
 

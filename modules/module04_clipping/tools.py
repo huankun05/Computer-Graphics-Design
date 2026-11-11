@@ -627,6 +627,7 @@ class ClipTool(ToolBase):
             self._set_msg("请先定义裁剪窗口（矩形拖拽 / 多边形布点）")
             return
         mask = self.window_pixels()
+        window = self.window_vertices()          # 几何窗口（世界坐标多边形）
         doc = self.canvas.document
         shapes = [s for s in doc.shapes if s.visible]
         entries = []                     # [(shape, before, after)]
@@ -641,6 +642,9 @@ class ClipTool(ToolBase):
                 continue
             before = snapshot(s)
             s.erased |= hit
+            # 几何挖除区域：窗口多边形随图元一起变换（旋转/缩放后仍是
+            # 干净的一块，不会像像素采样那样漏格 → 残留黑散点）
+            s.cuts.append([(int(x), int(y)) for x, y in window])
             entries.append((s, before, snapshot(s)))
             total += len(hit)
 
@@ -655,6 +659,7 @@ class ClipTool(ToolBase):
                 continue
             before = snapshot(f)
             f.erased |= hit
+            f.cuts.append([(int(x), int(y)) for x, y in window])
             entries.append((f, before, snapshot(f)))
             total += len(hit)
 
@@ -704,6 +709,8 @@ class ClipTool(ToolBase):
                 continue
             before = snapshot(s)
             s.erased |= out
+            # 几何挖除区域（窗口矩形）：随图元一起变换，旋转后仍是干净一块
+            s.cuts.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
             entries.append((s, before, snapshot(s)))
             total += len(out)
         # 依附于被裁图元的油漆桶填充：一起按窗口裁剪
@@ -718,6 +725,7 @@ class ClipTool(ToolBase):
                 continue
             before = snapshot(f)
             f.erased |= out
+            f.cuts.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
             entries.append((f, before, snapshot(f)))
             total += len(out)
 

@@ -246,6 +246,15 @@ try:
     ok(le.erased == {(1, 2)}, "擦除掩码往返")
     ok(isinstance(lf, RasterFillShape) and len(lf.pixels) == 3,
        "光栅填充像素往返")
+    # 裁剪窗口（几何挖除区域）必须往返：丢了它，重开工程后
+    # 被裁掉的区域一旋转又会冒黑散点
+    e2.cuts = [[(3.0, 4.0), (9.0, 4.0), (9.0, 8.0), (3.0, 8.0)]]
+    ok(save_project(path, [e2, rf]), "保存工程（含裁剪窗口）")
+    le2, _lf2 = load_project(path)
+    ok(getattr(le2, "cuts", None) and
+       [(float(x), float(y)) for x, y in le2.cuts[0]] ==
+       [(3.0, 4.0), (9.0, 4.0), (9.0, 8.0), (3.0, 8.0)],
+       f"裁剪窗口往返 {getattr(le2, 'cuts', None)}")
     ok(lf.conn == 8 and lf.algo == "seed8", "连通性/算法往返")
     ok(lf.owner is le, "填充归属往返")
 finally:

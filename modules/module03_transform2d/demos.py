@@ -47,7 +47,9 @@ def _shape_at(src, m):
     """克隆来源图元并施加矩阵（不动画布上的原件）。"""
     sh = copy.copy(src)
     restore(sh, snapshot(src))
+    # 动画演示的是【完整图形】：擦掉的像素与裁剪窗口都不参与
     sh.erased = set()
+    sh.cuts = []
     sh.visible = True
     transform_shape(sh, m)
     return sh

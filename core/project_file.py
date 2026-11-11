@@ -49,6 +49,9 @@ def _shape_to_dict(idx: int, s: Shape, all_shapes: List[Shape]) -> dict:
         d["inset"] = s.inset
     if getattr(s, "erased", None):
         d["erased"] = sorted(s.erased)
+    if getattr(s, "cuts", None):
+        # 裁剪窗口（几何区域）：顶点可能带小数（窗口被旋转/缩放过）
+        d["cuts"] = [[list(v) for v in poly] for poly in s.cuts]
     owner = getattr(s, "owner", None)
     if owner is not None:
         for j, cand in enumerate(all_shapes):
@@ -112,6 +115,9 @@ def _dict_to_shape(d: dict) -> Shape:
     s.visible = visible
     s.inset = int(d.get("inset", 0))
     s.erased = set(tuple(e) for e in d.get("erased", []))
+    # 裁剪窗口（几何挖除区域）：旧工程文件没有这个键 → 空列表
+    s.cuts = [[(float(x), float(y)) for x, y in poly]
+              for poly in d.get("cuts", [])]
     if kind != KIND_POLYGON:
         s.fill = bool(d.get("fill", False))    # 圆/椭圆填充默认关
     return s
