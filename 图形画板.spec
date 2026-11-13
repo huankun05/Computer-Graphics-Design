@@ -12,6 +12,8 @@ a = Analysis(
         'modules',                             # 课程模块包（registry 动态扫描）
         'modules.module01_color.module',       # 模块一：颜色模型（动态注册）
         'modules.module02_primitives.module',  # 模块二：基本图元（动态注册）
+        'modules.module03_transform2d.module', # 模块三：二维几何变换（动态注册）
+        'modules.module04_clipping.module',    # 模块四：区域裁剪（动态注册）
         'PySide6.QtSvg',                       # SVG 矢量图标渲染
     ],
     hookspath=[],
