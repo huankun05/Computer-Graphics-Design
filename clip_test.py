@@ -780,14 +780,20 @@ def _work_shape(step):
 
 
 def _stage_ord(value, total):
-    """阶段值 → 序号（"准备"=0，"k/N"=k，"完成"=total+1）；无法解析返回 None。"""
+    """阶段值 → 序号（"准备"=0，"k/N"=k，"收尾"=total+1，"完成"=total+2）。
+
+    "收尾"是新增的一段：边界走完后，窗口内还有一块填充没擦掉（窗口整块
+    落在图形内部时最明显），按层分几帧擦完，避免"凭空空一大块"。
+    """
     if value in (None, ""):
         return None
     s = str(value)
     if s == "准备":
         return 0
-    if s == "完成":
+    if s == "收尾":
         return total + 1
+    if s == "完成":
+        return total + 2
     try:
         return int(s.split("/")[0])
     except (ValueError, IndexError):
@@ -1046,6 +1052,85 @@ check_wa_alternating_path()
 print("-" * 64)
 print("裁剪页：空转步必须合并干净 + 阶段键完整")
 check_merge_and_stage()
+
+def check_fill_gradual():
+    """C17：裁剪页的【填充】不能"一次性空掉"。
+
+    旧做法：从挖掉的轮廓往里无限扩散（_peel_fill）⇒ 一段挖完，窗口内
+    整块填充同时消失，画面中间凭空空一大块（用户反馈："显示不对啊"）。
+    现在：填充按"归属"随边界逐段往里退；单帧最多擦掉窗口内填充的 1/4，
+    擦不完的排队，收尾阶段按层继续擦 ⇒ 洞是"往里长"的。
+
+    守卫（自包含：不引用实现里的任何新函数）：
+      · 单帧掉掉的填充 ≤ 窗口内填充总量的 30%（实现上限 25% + 余量）；
+      · 整段动画里，窗口内的填充必须被擦干净（不能漏）；
+      · 末帧仍 == 真实保留集（"演完即所得"）。
+    """
+    LIMIT = 0.30          # 单帧掉填充的上限（产品规则：1/4，留余量）
+    for page_name, demo_cls, is_line in PAGES:
+        for sname, make_shape in SUBJECTS:
+            if "填充" not in sname:
+                continue          # 只有带填充的图元才有"填充"这层
+            shape = make_shape()
+            cv = CanvasView()
+            cv.document.shapes.append(shape)
+            cv._render_base()
+            demo = demo_cls()
+            demo._canvas = cv
+            demo._spins = {}
+            steps = demo.make_steps(demo.collect())
+            tag = f"{page_name}/{sname}"
+            cv.close()
+            if not steps:
+                ok(False, f"{tag}: 未生成步骤流")
+                continue
+
+            # ---- 真实口径（照 ClipTool.apply_crop 的语义）----
+            rect = demo.window_rect()
+            x0, y0, x1, y1 = rect
+            outline, fill = rasterize(shape)
+            edge = {(int(x), int(y)) for x, y in outline}
+            fillonly = {(int(x), int(y)) for x, y in fill} - edge
+            fill_in = {p for p in fillonly
+                       if x0 <= p[0] <= x1 and y0 <= p[1] <= y1}
+            if not fill_in:
+                continue
+            cap = max(1, int(len(fill_in) * LIMIT))
+
+            # ---- 逐帧量：单帧掉多少填充 ----
+            worst = 0
+            worst_at = -1
+            removed_all = set()
+            prev = _px(steps[0].tint)
+            for i, st in enumerate(steps):
+                cur = _px(st.tint)
+                gone = prev - cur
+                removed_all |= gone
+                if len(gone) > worst:
+                    worst, worst_at = len(gone), i
+                prev = cur
+            ok(worst <= cap,
+               f"{tag}: 第 {worst_at} 帧一次擦掉 {worst} px 填充"
+               f"（窗口内共 {len(fill_in)} px，上限 {cap} px）"
+               f"——会看起来\"凭空空一大块\"")
+
+            # ---- 窗口内的填充必须被擦干净 ----
+            ok(fill_in <= removed_all,
+               f"{tag}: 窗口内还有 {len(fill_in - removed_all)} px 填充没擦掉")
+
+            # ---- 末帧 == 真实保留集 ----
+            allpx = edge | fillonly
+            real_kept = {p for p in allpx
+                         if not (x0 <= p[0] <= x1 and y0 <= p[1] <= y1)}
+            frame = _px(steps[-1].pixels) | _px(steps[-1].tint)
+            ok(frame == real_kept,
+               f"{tag}: 动画末帧 != 真实保留集"
+               f"（多出 {len(frame - real_kept)} / 缺少 {len(real_kept - frame)}）")
+
+
+print("-" * 64)
+print("裁剪页：填充不能一次性空掉（要一段段往里退）")
+check_fill_gradual()
 
 print("-" * 64)
 print("多边形窗口：画一个多边形区域去裁剪")

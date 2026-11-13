@@ -100,38 +100,116 @@ def _alive_runs(px, erased):
     return runs
 
 
-def _peel_fill(seeds, pool, allowed):
-    """从被挖掉的轮廓像素出发，把紧邻的填充像素一并"擦掉"。
+def _fill_owner(fill_px, seg_outline, mask):
+    """窗口内每个填充像素 → 归属哪一段（离它最近的窗口内轮廓像素）。
 
-    窗口内的填充是被轮廓围住的：轮廓被挖穿后，那块填充也就不再存在
-    （画布真实裁剪擦的是"轮廓∪填充 中落在窗口内的部分"）。这里做一次
-    4 邻域扩散，且只在窗口内扩散 ⇒ 被挖掉的边界往里"擦"，画面上就是
-    填充跟着边界一点点消失；而不是一上来把窗口内整块填充清掉——那样
-    画面中间会凭空空一大块，看着像"显示不对"。
+    真实裁剪擦掉的是"轮廓 ∪ 填充"里落在窗口内的部分，而填充是**一整块**
+    连通区域：边界被挖穿后它就不再存在。问题是"哪一部分填充随哪一段
+    一起消失"——用**归属**决定：每个填充像素归给离它最近的、落在窗口
+    内的轮廓像素所属的那一段。
 
-    seeds:   刚被挖掉的像素（轮廓）
-    pool:    当前还存在的填充像素
-    allowed: 窗口内的像素集合（扩散不能跑出窗口）
+    ★ 为什么不用"从挖掉的轮廓往里扩散"（旧做法）：
+      扩散没有深度上限 ⇒ 一段挖完，窗口内整块填充同时消失，画面中间
+      凭空空一大块（用户反馈："显示不对啊"）。归属法把填充切成按段
+      归属的若干块 ⇒ 挖一段少一块，填充是"从边界往里退"的。
+
+    返回 (owner, depth)：
+      owner[p] = 填充像素 p 归属的段号；
+      depth[p] = p 到【它归属的那段轮廓】的层深（贴着轮廓 = 1）。
+      depth 用来在"一帧擦不完"时，先擦浅的（贴轮廓的）、把深的排队。
+
+    seg_outline: 每段的轮廓像素（可为空段）。
+    mask:        窗口掩膜（只有窗口内的填充才会被挖掉）。
     """
-    if not seeds or not pool:
-        return set()
-    out = set()
-    stack = []
-    # 种子是【刚被挖掉的轮廓像素】——它们本身不在填充集里，
-    # 要先看它们四周的填充像素，再从那里往里扩散。
-    for p in seeds:
-        x, y = int(p[0]), int(p[1])
+    from collections import deque
+    owner = {}
+    depth = {}
+    dq = deque()
+    # 种子：紧邻"窗口内轮廓像素"的填充像素，标签 = 该轮廓像素所属段
+    for si, outline in enumerate(seg_outline):
+        for p in outline:
+            if p not in mask:
+                continue
+            x, y = int(p[0]), int(p[1])
+            for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if q in fill_px and q in mask and q not in owner:
+                    owner[q] = si
+                    depth[q] = 1
+                    dq.append(q)
+    # 多源 BFS：距离最近的段先到 ⇒ 归属就是"最近"
+    while dq:
+        p = dq.popleft()
+        si = owner[p]
+        x, y = p
         for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-            if q in pool and q in allowed and q not in out:
-                out.add(q)
-                stack.append(q)
-    while stack:
-        x, y = stack.pop()
-        for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-            if q in pool and q in allowed and q not in out:
-                out.add(q)
-                stack.append(q)
-    return out
+            if q in fill_px and q in mask and q not in owner:
+                owner[q] = si
+                depth[q] = depth[p] + 1
+                dq.append(q)
+    # 兜底：窗口内没被扩散到的填充（填充被窗口切成孤立块）→
+    # 归给欧氏距离最近的那个轮廓像素所属的段
+    rest = [p for p in fill_px if p in mask and p not in owner]
+    if rest:
+        seeds = [(si, p) for si, outline in enumerate(seg_outline)
+                 for p in outline if p in mask]
+        for p in rest:
+            if not seeds:
+                break
+            best = min(seeds, key=lambda t: (t[1][0] - p[0]) ** 2
+                       + (t[1][1] - p[1]) ** 2)
+            owner[p] = best[0]
+            depth[p] = int(((best[1][0] - p[0]) ** 2
+                            + (best[1][1] - p[1]) ** 2) ** 0.5) + 1
+    return owner, depth
+
+
+# 单帧最多擦掉"窗口内填充"的多少比例：剩下的排队，收尾阶段按层擦完。
+# 判据来自用户反馈"凭空空一大块，显示不对"——一次全空掉虽然数学上
+# 等价（真实裁剪就是整块删），但画面上是"凭空"少一块，看不出因果。
+FILL_BATCH_RATIO = 0.25
+
+
+class _FillEraser:
+    """填充橡皮擦：按归属逐段擦除，单帧不超预算，超出的排队收尾擦完。
+
+    · 归属（谁随哪段一起消失）由 _fill_owner 决定；
+    · 预算（单帧最多擦多少）由 FILL_BATCH_RATIO 决定：窗口内填充的
+      1/4。一段挖完，窗口内整块填充同时消失 ⇒ 画面中间凭空空一大块
+      （用户反馈："显示不对啊"）；
+    · 排队（这一帧擦不完的部分）按层深排队，收尾时一层层擦掉 ⇒
+      洞是"往里长"的，不会凭空少一块。
+    """
+
+    def __init__(self, owner, depth, budget):
+        self.owner = owner
+        self.depth = depth
+        self.budget = max(1, int(budget))
+        self.deferred = set()
+
+    def _order(self, cand):
+        """按层深排序（浅的 = 贴着轮廓的先擦）。"""
+        return sorted(cand, key=lambda p: (self.depth.get(p, 0), p))
+
+    def take(self, seg_index, fill_now):
+        """本段该擦掉的填充；超出预算的排队。"""
+        cand = {p for p, oi in self.owner.items()
+                if oi == seg_index and p in fill_now}
+        if len(cand) <= self.budget:
+            return cand
+        ordered = self._order(cand)
+        take = set(ordered[:self.budget])
+        self.deferred |= (cand - take)
+        return take
+
+    def drain(self, fill_now):
+        """收尾：再擦一批（按层深由浅入深），每批不超过预算。"""
+        cand = {p for p in self.deferred if p in fill_now}
+        if not cand:
+            return set()
+        ordered = self._order(cand)
+        take = set(ordered[:self.budget])
+        self.deferred -= take
+        return take
 
 
 def _work_shape(step):
@@ -692,6 +770,14 @@ class _LineClipDemo(_ClipDemoBase):
             steps.append(st)
 
         # ---- 逐段遍历：每段跑一遍本页算法，判定完就挖掉窗口内部分 ----
+        # 填充归属：窗口内每块填充归给"离它最近的、落在窗口内的轮廓像素"
+        # 所属的那一段 ⇒ 挖一段少一块，填充是从边界往里退的。
+        # （旧做法是从挖掉的轮廓往里无限扩散 ⇒ 一段挖完，窗口内整块填充
+        #   同时消失，画面中间凭空空一大块，用户反馈"显示不对"。）
+        owner, depth = _fill_owner(fill_now,
+                                   [owned for (_a, _b, owned) in pieces], mask)
+        eraser = _FillEraser(owner, depth,
+                             len(fill_in) * FILL_BATCH_RATIO)
         for i, (a, b, owned) in enumerate(pieces):
             part = self._steps(a[0], a[1], b[0], b[1], window)
             if not part:
@@ -707,13 +793,12 @@ class _LineClipDemo(_ClipDemoBase):
                         line_guide(lo, hi, GUIDE_MOVE, dash=True, width=2.6)]
                 if k == len(part) - 1 and cut:
                     # 本段判定完成 → 落在窗口内的部分被挖除；
-                    # 紧邻它的窗口内填充随之被"擦掉"（像橡皮擦沿着
-                    # 边界往里擦），否则填满的图元会在窗口里留下
-                    # 一个洞，与画布真实裁剪对不上。
-                    # 早先是一上来就把窗口内【全部】填充清掉——画面
-                    # 中间凭空空一大块，看起来像"显示不对"。
+                    # 与之相邻的那层窗口内填充也随之消失（按归属：
+                    # 这一段"拥有"的那块填充），否则填满的图元会在
+                    # 窗口里留下一个洞，与画布真实裁剪对不上。
+                    # 单帧擦不掉的部分排队，收尾时按层继续擦。
                     current -= cut
-                    peel = _peel_fill(cut, fill_now, mask)
+                    peel = eraser.take(i, fill_now)
                     fill_now -= peel
                     current -= peel
                 st.pixels = sorted(current)
@@ -735,6 +820,29 @@ class _LineClipDemo(_ClipDemoBase):
                     st.values = {**st.values, "段": "1/1"}
             steps.extend(part)
 
+        # ---- 收尾：排队中的填充按层擦完 ----
+        # 边界走完时，窗口内还有一块填充没被擦掉（窗口整块落在图形内部
+        # 时最明显）。一次擦完就是"凭空空一大块"，所以按层分几帧擦，
+        # 让画面上是"洞往里长"，而不是"少了一块"。
+        guide = self.window_guide(window)
+        drain_no = 0
+        while True:
+            peel = eraser.drain(fill_now)
+            if not peel:
+                break
+            drain_no += 1
+            current -= peel
+            fill_now -= peel
+            left = len({p for p in fill_now if p in mask})
+            vals = dict(steps[-1].values) if steps else {}
+            vals["判定"] = "擦除剩余"
+            vals["段"] = "收尾"
+            steps.append(Step(
+                sorted(current), vals,
+                f"收尾：窗口内剩余区域继续擦除"
+                f"（第 {drain_no} 批，窗口内还剩 {left} 像素）",
+                guides=[guide] if guide else [], tint=sorted(fill_now)))
+
         # ---- 末帧 = 画布真实裁剪结果（窗口外保留） ----
         # 无论上一帧像素是否已相同都补一帧"完成"：算法末步仍带着
         # 紫色"当前线段"注记，不补的话定格画面会残留一条线，
@@ -744,7 +852,6 @@ class _LineClipDemo(_ClipDemoBase):
         vals = dict(steps[-1].values) if steps else {}
         vals["判定"] = "完成"
         vals["段"] = "完成"
-        guide = self.window_guide(window)
         steps.append(Step(
             sorted(current), vals,
             "裁剪完成：窗口内部分已挖除，只保留窗口外",
@@ -1378,8 +1485,9 @@ class PolygonClipWADemo(_PolyClipDemo):
                        guides=list(base_guides), tint=sorted(fill_now))]
 
         total = len(path)
+        # ---- 切分动作单元：P 段（图形边）按 PIECE_LEN 切块，W 段整体一块 ----
+        units = []
         for si, seg in enumerate(path, start=1):
-            kind = seg["kind"]
             pts = seg["pts"]
             if len(pts) < 2:
                 continue
@@ -1388,45 +1496,78 @@ class PolygonClipWADemo(_PolyClipDemo):
                 chunk = pts[k:k + step_len + 1]
                 if len(chunk) < 2:
                     continue
-                a, b = chunk[0], chunk[-1]
-                if kind == "P":
-                    # 图形边：落在窗口内的像素被挖除
-                    cut = {(int(round(x)), int(round(y)))
-                           for x, y in chunk
-                           if (int(round(x)), int(round(y))) in mask}
-                    cut &= current
-                    current -= cut
-                    peel = _peel_fill(cut, fill_now, mask)
-                    fill_now -= peel
-                    current -= peel
-                    note = ("沿图形边前进：这一段落在裁剪窗口内 → 挖除"
-                            if cut else
-                            "沿图形边前进：这一段在窗口外 → 保留")
-                    vals = {"阶段": "图形边", "判定": "在窗口内 → 挖除"
-                            if cut else "在窗口外 → 保留",
-                            "本段": f"{len(cut)} 像素",
-                            "进入点": f"({seg['enter'][0]:.1f}, "
-                                     f"{seg['enter'][1]:.1f})",
-                            "离开点": f"({seg['leave'][0]:.1f}, "
-                                     f"{seg['leave'][1]:.1f})",
-                            "段": f"{si}/{total}"}
-                    guides = base_guides + [line_guide(a, b, GUIDE_MOVE,
-                                                       dash=True, width=2.6)]
-                else:
-                    # 窗口边：交集边界的另一半（不挖像素，只画出来）
-                    note = ("沿裁剪窗口边前进：窗口的边落在图形内 —— "
-                            "这是交集边界的另一半")
-                    vals = {"阶段": "窗口边", "判定": "窗口的边落在图形内",
-                            "本段": f"{len(chunk)} 个点",
-                            "进入点": f"({seg['enter'][0]:.1f}, "
-                                     f"{seg['enter'][1]:.1f})",
-                            "离开点": f"({seg['leave'][0]:.1f}, "
-                                     f"{seg['leave'][1]:.1f})",
-                            "段": f"{si}/{total}"}
-                    guides = base_guides + [line_guide(a, b, GUIDE_MARK,
-                                                       dash=False, width=3.0)]
-                steps.append(Step(sorted(current), vals, note,
-                                   guides=guides, tint=sorted(fill_now)))
+                units.append((si, seg, chunk))
+
+        # 填充归属：窗口内每块填充归给"离它最近的、落在窗口内的轮廓像素"
+        # 所属的那个动作单元 ⇒ 挖一块少一块，填充是从边界往里退的。
+        # （旧做法是从挖掉的轮廓往里无限扩散 ⇒ 一块挖完，窗口内整块填充
+        #   同时消失，画面中间凭空空一大块，用户反馈"显示不对"。）
+        owner, depth = _fill_owner(
+            fill_now,
+            [{(int(round(x)), int(round(y))) for x, y in chunk}
+             if seg["kind"] == "P" else set()
+             for (_si, seg, chunk) in units],
+            mask)
+        eraser = _FillEraser(owner, depth, len(fill_in) * FILL_BATCH_RATIO)
+
+        for ui, (si, seg, chunk) in enumerate(units):
+            kind = seg["kind"]
+            a, b = chunk[0], chunk[-1]
+            if kind == "P":
+                # 图形边：落在窗口内的像素被挖除
+                cut = {(int(round(x)), int(round(y)))
+                       for x, y in chunk
+                       if (int(round(x)), int(round(y))) in mask}
+                cut &= current
+                current -= cut
+                peel = eraser.take(ui, fill_now)
+                fill_now -= peel
+                current -= peel
+                note = ("沿图形边前进：这一段落在裁剪窗口内 → 挖除"
+                        if cut else
+                        "沿图形边前进：这一段在窗口外 → 保留")
+                vals = {"阶段": "图形边", "判定": "在窗口内 → 挖除"
+                        if cut else "在窗口外 → 保留",
+                        "本段": f"{len(cut)} 像素",
+                        "进入点": f"({seg['enter'][0]:.1f}, "
+                                 f"{seg['enter'][1]:.1f})",
+                        "离开点": f"({seg['leave'][0]:.1f}, "
+                                 f"{seg['leave'][1]:.1f})",
+                        "段": f"{si}/{total}"}
+                guides = base_guides + [line_guide(a, b, GUIDE_MOVE,
+                                                   dash=True, width=2.6)]
+            else:
+                # 窗口边：交集边界的另一半（不挖像素，只画出来）
+                note = ("沿裁剪窗口边前进：窗口的边落在图形内 —— "
+                        "这是交集边界的另一半")
+                vals = {"阶段": "窗口边", "判定": "窗口的边落在图形内",
+                        "本段": f"{len(chunk)} 个点",
+                        "进入点": f"({seg['enter'][0]:.1f}, "
+                                 f"{seg['enter'][1]:.1f})",
+                        "离开点": f"({seg['leave'][0]:.1f}, "
+                                 f"{seg['leave'][1]:.1f})",
+                        "段": f"{si}/{total}"}
+                guides = base_guides + [line_guide(a, b, GUIDE_MARK,
+                                                   dash=False, width=3.0)]
+            steps.append(Step(sorted(current), vals, note,
+                               guides=guides, tint=sorted(fill_now)))
+
+        # ---- 收尾：排队中的填充按层擦完（不一次空掉一整块）----
+        drain_no = 0
+        while True:
+            peel = eraser.drain(fill_now)
+            if not peel:
+                break
+            drain_no += 1
+            current -= peel
+            fill_now -= peel
+            left = len({p for p in fill_now if p in mask})
+            vals = dict(steps[-1].values) if steps else {}
+            vals.update({"阶段": "收尾", "判定": "擦除剩余", "段": "收尾"})
+            steps.append(Step(sorted(current), vals,
+                               "收尾：窗口内剩余区域继续擦除"
+                               f"（第 {drain_no} 批，窗口内还剩 {left} 像素）",
+                               guides=list(base_guides), tint=sorted(fill_now)))
 
         # 兜底：窗口内还剩下的像素（交点处取整可能差一格）一并清掉，
         # 末帧 = 画布真实裁剪结果（"演完即所得"）
