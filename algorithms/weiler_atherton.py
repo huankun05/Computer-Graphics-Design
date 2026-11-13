@@ -519,17 +519,26 @@ def _slice_path(seq: Sequence[Point], i0: int, pt0: Point,
 
 
 def _next_node(nodes: Sequence[Tuple[int, Point, str]], k: int,
-               kind: str) -> Optional[int]:
+               kind: str, used=None) -> Optional[int]:
     """从第 k 个节点出发，沿序列方向找下一个 kind 节点的下标。
 
     只有第 k 个节点自己属于 kind 时返回 None（没有"下一个"）——
     否则会把 k 本身当成下一个，走成自环。
+
+    used：已消费过的节点下标集合。已消费的不再作为"下一个"候选——
+    交集可能分成好几条链（图形在窗口里进出多次），下一条链否则会把
+    上一条链的节点重新走一遍 ⇒ 同一段动画无限重复（用户反馈 2026-11-13：
+    "怎么一直动画反复"，实测五边形 × 矩形窗产出 50 段，其中 6 个不同的
+    段各重复了 8 遍）。
     """
     n = len(nodes)
     for step in range(1, n):
         idx = (k + step) % n
-        if nodes[idx][2] == kind:
-            return idx
+        if nodes[idx][2] != kind:
+            continue
+        if used is not None and idx in used:
+            continue
+        return idx
     return None
 
 
@@ -542,87 +551,184 @@ def _find_node(nodes: Sequence[Tuple[int, Point, str]], pt: Point,
     return None
 
 
+def _nearest_index(seq: Sequence[Point], pt: Point) -> int:
+    """点列中离 pt 最近的点的下标（用于把几何交点贴回栅格化轮廓）。"""
+    best, bd = 0, None
+    for i, q in enumerate(seq):
+        d = (q[0] - pt[0]) ** 2 + (q[1] - pt[1]) ** 2
+        if bd is None or d < bd - 1e-12:
+            bd, best = d, i
+    return best
+
+
+def _match_index(crossings: Sequence[Tuple[int, float, Point]], pt: Point,
+                 tol: float = 1e-6) -> Optional[int]:
+    """在交点表里找"同一个几何点"的下标。"""
+    for k, (_i, _t, q) in enumerate(crossings):
+        if abs(q[0] - pt[0]) <= tol and abs(q[1] - pt[1]) <= tol:
+            return k
+    return None
+
+
+def _mostly_inside(window: Sequence[Point], pts: Sequence[Point],
+                   samples: int = 24) -> bool:
+    """轮廓是否（几乎）整体落在窗口内。
+
+    图形完全被窗口罩住时没有交点，交集边界就是图形自己的整条轮廓——
+    这时同样要有一条"全是图形边"的路径，动画才不是空转（否则该页
+    播放毫无反应）。
+    """
+    if not pts:
+        return False
+    step = max(1, len(pts) // samples)
+    hit = 0
+    total = 0
+    for p in pts[::step]:
+        total += 1
+        if _point_in(list(window), p):
+            hit += 1
+    return total > 0 and hit * 5 >= total * 4       # 80% 以上算整体在内
+
+
 def wa_outline_path(edges_pts: Sequence[Sequence[Point]],
-                    window: Sequence[Point]) -> List[dict]:
+                    window: Sequence[Point],
+                    geom_points: Optional[Sequence[Point]] = None
+                    ) -> List[dict]:
     """Weiler-Atherton 交集边界：沿【图形边】↔【窗口边】交替前进。
 
     这才是"双边"的完整含义：交集边界由两类段**交替**组成——
       · P 段：图形边落在窗口内的部分（沿图形方向）→ 这条边的像素要被挖除；
       · W 段：窗口边落在图形内的部分（沿窗口方向）→ 交集边界的另一半。
 
-    edges_pts: 图形轮廓按"边"分组的有序点列（每组一条边的像素），
-               相邻点连线就是该边 ⇒ 判定轨迹与原轮廓逐像素重合。
-    window:    裁剪窗口多边形顶点（任意简单多边形）。
+    edges_pts:  图形轮廓按"边"分组的有序点列（每组一条边的像素），
+                相邻点连线就是该边 ⇒ 判定轨迹与原轮廓逐像素重合。
+    window:     裁剪窗口多边形顶点（任意简单多边形）。
+    geom_points: 主体的**几何多边形顶点**（求交用）。
+                传了就用真实几何求交（交点精确、无退化）；
+                不传就退化到用 edges_pts 拼出的折线（栅格阶梯）。
+
+    ★ 为什么求交必须用真实几何（用户反馈 2026-11-13："怎么一直动画反复"）：
+      栅格化的轮廓是**阶梯**，斜边走到窗口边界时可能正好"歇一步"——
+      那一小段与窗口边共线，于是同一个真实交点被拆成**两个**（进入 +
+      离开），多出一个伪交点。伪交点让"下一条链"从它重新出发，把同一
+      段动画又走一遍（实测五边形 × 矩形窗：真实 6 个交点 → 路径产出
+      50 段，其中 6 个不同的段各重复 8 遍）。
+      现在求交在真实几何上做（交点唯一），栅格化轮廓只用来"贴"出
+      视觉轨迹 ⇒ 交替段既准确又不会重复。
 
     返回交替段序列，每项：
       {"kind": "P"/"W", "pts": [...], "enter": pt, "leave": pt, "edge": i}
-    无交点（图形整体在窗口内或整体在外）时返回空列表。
+    图形整体在窗口外（无交集）时返回空列表。
     """
     if not edges_pts or len(window) < 3:
         return []
     W = _to_ccw(window)
-    # 图形侧：把各边的像素拼成一条闭合折线（首尾相接）
+    Wc = _closed(W)
+
+    # ---- 几何源（求交用）----
+    # 几何源统一成逆时针；若主体原本是顺时针，栅格轮廓也要跟着反向，
+    # 否则"沿图形方向"的顺序与求交顺序相反（进入/离开会整体取反）。
+    G: Optional[List[Point]] = None
+    if geom_points and len(geom_points) >= 3:
+        grow = [(float(x), float(y)) for x, y in geom_points]
+        G = _to_ccw(grow)
+        if not _same_seq(G, grow):
+            edges_pts = [list(reversed(list(e))) for e in
+                         reversed(list(edges_pts))]
+        # ★ 必须闭合：多边形的【收尾那一条边】（末顶点 → 首顶点）同样
+        #   会与窗口边界求交，漏掉它 → 少求出一半交点；而且路径中点会
+        #   算在"少了收尾边"的折线上 ⇒ 进入/离开分类整体取反
+        #   （实测：三角形 × 矩形窗因此一条路径都走不出来）。
+        G = _closed(G)
+
+    # ---- 图形侧：把各边的像素拼成一条闭合折线（首尾相接）----
     # 相邻两段首尾相接（上一段的末点 = 下一段的首点），拼接时每段
     # 去掉【首点】保留【末点】——若去掉末点，最后一段的末点会整段丢失
     # （圆的极左点正好落在那里，画面上会剩一个孤立的蓝点）。
     S: List[Point] = []
-    edge_of: List[int] = []
-    for ei, pts in enumerate(edges_pts):
+    for pts in edges_pts:
         if len(pts) < 2:
             continue
         start = 0 if not S else 1
         for q in pts[start:]:
             S.append((float(q[0]), float(q[1])))
-            edge_of.append(ei)
     if len(S) < 3:
         return []
     S = _closed(S)
-    Wc = _closed(W)
+    if G is None:
+        G = S
 
-    p_cross = _poly_crossings(S, Wc)
-    w_cross = _poly_crossings(Wc, S)
-    if not p_cross or not w_cross:
+    p_cross = _poly_crossings(G, Wc)
+    if not p_cross:
+        # 没有交点：图形整体在窗口外（无交集）或整体被窗口罩住。
+        # 后者交集边界就是图形自己的整条轮廓 → 给一条"全是图形边"的
+        # 路径，动画才是"整块挖除"，而不是该页毫无反应。
+        if _mostly_inside(W, S):
+            return [{"kind": "P", "pts": list(S), "enter": S[0],
+                     "leave": S[-1], "edge": 0}]
+        return []
+    w_cross = _poly_crossings(Wc, G)
+    if not w_cross:
         return []
 
-    p_kinds = _classify(S, Wc, p_cross)
-    w_kinds = _classify(Wc, S, w_cross)
+    # ---- 分类：进入 / 离开 ----
+    p_kinds = _classify(G, Wc, p_cross)
+    # 窗口侧的类型直接取图形侧的**反**（横截交叉时二者互补）：
+    # 图形"进入窗口"的地方就是窗口"离开图形"的地方。两边各自算
+    # 会在退化情形下算岔（同一个交点在两侧指向不同的点），
+    # 取反保证两侧节点一一对应。
+    w_kinds_raw = _classify(Wc, G, w_cross)
+    w_kinds: List[str] = []
+    for k, (_wi, _t, pt) in enumerate(w_cross):
+        pk = _match_index(p_cross, pt)
+        if pk is None:
+            w_kinds.append(w_kinds_raw[k])
+        else:
+            w_kinds.append("离开" if p_kinds[pk] == "进入" else "进入")
+
     p_nodes = [(i, pt, k) for (i, _t, pt), k in zip(p_cross, p_kinds)]
     w_nodes = [(i, pt, k) for (i, _t, pt), k in zip(w_cross, w_kinds)]
+    # 每个图形侧交点在栅格轮廓 S 上的最近点下标（P 段轨迹要贴着原图）
+    s_idx = [_nearest_index(S, pt) for (_i, pt, _k) in p_nodes]
 
     out: List[dict] = []
-    used = set()
+    used_p: set = set()
+    used_w: set = set()
     for start in range(len(p_nodes)):
-        if p_nodes[start][2] != "进入" or start in used:
+        if p_nodes[start][2] != "进入" or start in used_p:
             continue
         start_pt = p_nodes[start][1]
         k = start
         guard = 0
         while guard < len(p_nodes) * 2 + 8:
             guard += 1
-            used.add(k)
+            if k in used_p:
+                break
+            used_p.add(k)
             # ---- P 段：从进入点沿图形边走到下一个离开点 ----
-            k_leave = _next_node(p_nodes, k, "离开")
+            k_leave = _next_node(p_nodes, k, "离开", used_p)
             if k_leave is None:
                 break
+            used_p.add(k_leave)
             i_leave, pt_leave, _ = p_nodes[k_leave]
             i_enter, pt_enter, _ = p_nodes[k]
             out.append({"kind": "P",
-                        "pts": _slice_path(S, i_enter, pt_enter,
-                                           i_leave, pt_leave,
-                                           wrap=(k_leave <= k)),
+                        "pts": _raster_run(S, s_idx[k], s_idx[k_leave],
+                                           pt_enter, pt_leave),
                         "enter": pt_enter, "leave": pt_leave,
-                        "edge": edge_of[i_enter] if i_enter < len(edge_of)
-                        else 0})
-            # ---- W 段：从离开点沿窗口边走到下一个进入点 ----
+                        "edge": i_enter})
+            # ---- W 段：从离开点沿窗口边走到下一个离开点 ----
             # 图形在离开点"离开窗口" ⇒ 沿窗口方向此处"进入图形"
             # （横截交叉时二者互补），所以窗口边上的下一段要走到
             # "窗口离开图形"的那个交点——它正是下一个图形进入点。
             kw = _find_node(w_nodes, pt_leave)
             if kw is None:
                 break
-            kw_next = _next_node(w_nodes, kw, "离开")
+            used_w.add(kw)
+            kw_next = _next_node(w_nodes, kw, "离开", used_w)
             if kw_next is None:
                 break
+            used_w.add(kw_next)
             j_next, pt_next, _ = w_nodes[kw_next]
             out.append({"kind": "W",
                         "pts": _slice_path(Wc, w_nodes[kw][0], pt_leave,
@@ -638,6 +744,41 @@ def wa_outline_path(edges_pts: Sequence[Sequence[Point]],
                     abs(pt_next[1] - start_pt[1]) < 1e-6:
                 break           # 回到起点 → 闭环
             k = kp
+    return out
+
+
+def _same_seq(a: Sequence[Point], b: Sequence[Point]) -> bool:
+    """两个点列是否同序同点（逐点比较）。"""
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if abs(a[i][0] - b[i][0]) > 1e-12 or abs(a[i][1] - b[i][1]) > 1e-12:
+            return False
+    return True
+
+
+def _raster_run(S: Sequence[Point], i0: int, i1: int,
+                pt_enter: Point, pt_leave: Point) -> List[Point]:
+    """P 段的视觉轨迹：栅格轮廓 S 上从进入点到离开点的那一段。
+
+    轨迹必须取**栅格化轮廓**上的像素（用户反馈："画出来的轨迹和原来的
+    轨迹不一样，像是两种画法"）——求交在真实几何上做，交点再贴回最近
+    的栅格像素，两端补上精确交点，保证与 W 段首尾相接。
+    索引顺序反了（映射误差）就退回直线弦，不绕整圈。
+    """
+    n = len(S) - 1                      # S 是闭合点列，末点 = 首点
+    if not (0 <= i0 < n and 0 <= i1 < n):
+        return [pt_enter, pt_leave]
+    if i1 < i0:
+        return [pt_enter, pt_leave]
+    run = [S[i] for i in range(i0, i1 + 1)]
+    out = [pt_enter]
+    for p in run:
+        if abs(p[0] - out[-1][0]) > 1e-9 or abs(p[1] - out[-1][1]) > 1e-9:
+            out.append(p)
+    if abs(out[-1][0] - pt_leave[0]) > 1e-9 or \
+            abs(out[-1][1] - pt_leave[1]) > 1e-9:
+        out.append(pt_leave)
     return out
 
 

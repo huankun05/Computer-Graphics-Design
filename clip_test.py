@@ -627,6 +627,142 @@ def check_exact_intersection():
            f"{algo_name}: 输出顶点全是整数（几何出口应是浮点精确交点）")
 
 
+def _seg_cross_t(a, b, c, d):
+    """线段 AB 与 CD 是否相交（守卫自带，不依赖实现里的任何函数）。"""
+    rx, ry = b[0] - a[0], b[1] - a[1]
+    sx, sy = d[0] - c[0], d[1] - c[1]
+    den = rx * sy - ry * sx
+    if abs(den) < 1e-12:
+        return None
+    qx, qy = c[0] - a[0], c[1] - a[1]
+    t = (qx * sy - qy * sx) / den
+    u = (qx * ry - qy * rx) / den
+    if -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9:
+        return t, u
+    return None
+
+
+def _true_crossings(subject, window):
+    """主体多边形 × 窗口多边形的真实交点（守卫自带的期望值）。
+
+    守卫自己按"线段求交"算一遍：这样期望值与实现**不同源**，
+    实现取整/多算/少算都能被抓出来。
+    """
+    n, m = len(subject), len(window)
+    pts = []
+    for i in range(n):
+        a, b = subject[i], subject[(i + 1) % n]
+        for j in range(m):
+            c, d = window[j], window[(j + 1) % m]
+            hit = _seg_cross_t(a, b, c, d)
+            if hit is None:
+                continue
+            t = hit[0]
+            p = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+            if any(abs(p[0] - q[0]) < 1e-6 and abs(p[1] - q[1]) < 1e-6
+                   for q in pts):
+                continue                 # 顶点处算两遍，去重
+            pts.append(p)
+    return pts
+
+
+def check_wa_alternating_path():
+    """C14：双边裁剪的交替路径不得把同一段反复播放。
+
+    用户反馈（2026-11-13）："双边裁剪还是有问题，怎么一直动画反复"。
+
+    病灶（实测）：演示动画沿【栅格化的阶梯轮廓】求交。斜边走到窗口
+    边界时可能正好"歇一步"（那一小段与窗口边共线），同一个真实交点
+    被拆成"进入 + 离开"两个 ⇒ 多出一个伪交点；行走时又没有"已消费
+    节点"约束，外层循环从这个伪进入点重新出发，把同一段又走一遍。
+    实测：五边形 × 矩形窗（默认窗口 16,12–46,34）产出 50 段，其中
+    6 个不同的段各重复 8 遍 —— 画面上就是同一段动画反复播。
+
+    守卫自带期望：真实几何下"主体边 × 窗口边"的交点数（自己算）。
+    进入/离开成对出现 ⇒ 交替路径的段数应等于交点数（一半 P 段、
+    一半 W 段），且任何一段都不得重复出现。
+    """
+    from algorithms.line_bresenham import bresenham_line
+    from algorithms.weiler_atherton import wa_outline_path
+
+    subject = [(10, 8), (40, 6), (48, 24), (30, 40), (12, 28)]
+    window = [(16, 12), (46, 12), (46, 34), (16, 34)]
+    f_subject = [(float(x), float(y)) for x, y in subject]
+    f_window = [(float(x), float(y)) for x, y in window]
+
+    true_n = len(_true_crossings(f_subject, f_window))
+    ok(true_n == 6,
+       f"双边交替路径: 守卫自算的交点数 {true_n} != 6（守卫数据变了？）")
+
+    # ---- 路径层面：不得有重复段 ----
+    edges = []
+    for i in range(len(subject)):
+        a, b = subject[i], subject[(i + 1) % len(subject)]
+        edges.append([(float(x), float(y)) for x, y in
+                      bresenham_line(a[0], a[1], b[0], b[1])])
+    path = wa_outline_path(edges, f_window)
+    ok(bool(path),
+       f"双边交替路径: 没有生成任何段（真实交点 {true_n} 个）")
+    if not path:
+        return
+
+    sigs = {}
+    for i, seg in enumerate(path):
+        pts = seg["pts"]
+        sig = (seg["kind"], round(pts[0][0], 3), round(pts[0][1], 3),
+               round(pts[-1][0], 3), round(pts[-1][1], 3))
+        sigs.setdefault(sig, []).append(i + 1)
+    dup = {k: v for k, v in sigs.items() if len(v) > 1}
+    ok(not dup,
+       f"双边交替路径: {len(dup)} 组段被重复播放（同一段出现多次，"
+       f"动画会一直反复）——如 {list(dup.values())[:3]}")
+
+    kinds = [s["kind"] for s in path]
+    ok(all(kinds[i] != kinds[i + 1] for i in range(len(kinds) - 1)),
+       f"双边交替路径: 段类型没有交替（{kinds}）")
+
+    # ---- 演示页层面：交替段总数 == 真实交点数，且步数不得爆炸 ----
+    shape = PolygonShape(kind=KIND_POLYGON, fill=True, vertices=subject,
+                         color=QColor("#222222"))
+    cv = CanvasView()
+    cv.document.shapes.append(shape)
+    cv._render_base()
+    demo = PolygonClipWADemo()
+    demo._canvas = cv
+    demo._spins = {}
+    steps = demo.make_steps(demo.collect())
+    ok(bool(steps), "双边裁剪演示页: 未生成步骤流")
+    if not steps:
+        cv.close()
+        return
+
+    totals = set()
+    for st in steps:
+        seg_val = str(st.values.get("段", ""))
+        if "/" in seg_val:
+            totals.add(seg_val.split("/")[-1])
+    ok(totals == {str(true_n)},
+       f"双边裁剪演示页: 交替段总数 {sorted(totals)} != 真实交点数 "
+       f"{true_n}（求交多算/少算了交点 ⇒ 同一段被反复播放）")
+
+    ok(len(steps) <= true_n * 6 + 6,
+       f"双边裁剪演示页: {len(steps)} 步远超交点数 {true_n}（同一段被"
+       f"反复播放；旧实现这一例是 68 步）")
+
+    # ---- 末帧 == 真实裁剪结果 ----
+    rect = demo.window_rect()
+    x0, y0, x1, y1 = rect
+    outline, fill = rasterize(shape)
+    allpx = {(int(x), int(y)) for x, y in outline + fill}
+    real_kept = {p for p in allpx
+                  if not (x0 <= p[0] <= x1 and y0 <= p[1] <= y1)}
+    frame = _px(steps[-1].pixels) | _px(steps[-1].tint)
+    ok(frame == real_kept,
+       f"双边裁剪演示页: 动画末帧 != 真实保留集"
+       f"（多出 {len(frame - real_kept)} / 缺少 {len(real_kept - frame)}）")
+    cv.close()
+
+
 def check_polygon_window():
     """C12：多边形窗口（画一个多边形区域去裁剪）必须与真实裁剪同口径。
 
@@ -805,6 +941,10 @@ ok(MAX_FPS >= 240 - 1e-9, f"播放器最快档 {MAX_FPS:g} 步/秒（应 ≥240�
 print("-" * 64)
 print("几何出口：斜边交点不能被取整（几何精确性）")
 check_exact_intersection()
+
+print("-" * 64)
+print("双边裁剪：交替路径不得反复播放同一段")
+check_wa_alternating_path()
 
 print("-" * 64)
 print("多边形窗口：画一个多边形区域去裁剪")

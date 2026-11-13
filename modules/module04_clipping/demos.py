@@ -1070,6 +1070,9 @@ class _PolyClipDemo(_LineClipDemo):
 
         相邻两段必须首尾相接：双边交替路径要把各段拼成一条闭合折线，
         段与段之间不能有缺口，否则求交得到的边界会横穿缺口。
+
+        每段至少 2 个点：末尾若只剩 1 个点（长度不是整除时），
+        拼接时会整段被丢，那个像素就从轮廓上消失了。
         """
         from algorithms.line_bresenham import bresenham_line
         from core.shapes import CircleShape, EllipseShape, PolygonShape
@@ -1088,8 +1091,50 @@ class _PolyClipDemo(_LineClipDemo):
             return out
         if isinstance(src, (CircleShape, EllipseShape)):
             full = _outline_pixels_sorted(src, ignore_erased=True)
+            if len(full) < 2:
+                return []
             step = max(2, self._PIECE_LEN)
-            return [full[i:i + step + 1] for i in range(0, len(full), step)]
+            out = []
+            i = 0
+            n = len(full)
+            while i < n - 1:
+                j = min(i + step, n - 1)
+                out.append(full[i:j + 1])
+                i = j
+            return out
+        return []
+
+    def _geom_points(self):
+        """主体的几何多边形顶点（**求交用**）。
+
+        ★ 求交必须在真实几何上做，不能拿栅格化的阶梯轮廓：
+          阶梯的斜边走到窗口边界时可能正好"歇一步"（那一小段与窗口边
+          共线），同一个真实交点会被拆成"进入 + 离开"两个 ⇒ 多出一个
+          伪交点；行走时又从这个伪进入点重新出发，把同一段动画反复
+          播放（用户反馈 2026-11-13："怎么一直动画反复"——实测五边形
+          × 矩形窗产出 50 段，6 个不同的段各重复 8 遍）。
+
+        多边形 → 真实顶点；圆/椭圆 → 均匀采样的多边形近似（采样点沿
+        栅格轮廓的极角顺序，保证与轮廓同向）。
+        """
+        import math
+        from core.shapes import CircleShape, EllipseShape, PolygonShape
+        src = self.playback_source()
+        if src is None:
+            return []
+        if isinstance(src, PolygonShape):
+            return [(float(x), float(y)) for x, y in src.vertices]
+        cx, cy = float(src.center[0]), float(src.center[1])
+        if isinstance(src, CircleShape):
+            r = float(src.r)
+            return [(cx + r * math.cos(2 * math.pi * k / 72),
+                     cy + r * math.sin(2 * math.pi * k / 72))
+                    for k in range(72)]
+        if isinstance(src, EllipseShape):
+            rx, ry = float(src.rx), float(src.ry)
+            return [(cx + rx * math.cos(2 * math.pi * k / 72),
+                     cy + ry * math.sin(2 * math.pi * k / 72))
+                    for k in range(72)]
         return []
 
     def make_steps(self, params):
@@ -1224,7 +1269,8 @@ class PolygonClipWADemo(_PolyClipDemo):
             return []
         path = wa_outline_path(
             [[(float(x), float(y)) for x, y in e] for e in edges],
-            [(float(x), float(y)) for x, y in window])
+            [(float(x), float(y)) for x, y in window],
+            geom_points=self._geom_points())
         if not path:
             # 没有交点：图形整体在窗口内或整体在外，这一页没有可演示的
             # 交替过程（提示交给 empty_hint）
