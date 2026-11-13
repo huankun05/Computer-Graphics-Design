@@ -28,7 +28,8 @@
 =====================================================================
 """
 
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QSpinBox, QVBoxLayout
+from PySide6.QtWidgets import (QCheckBox, QGridLayout, QHBoxLayout, QLabel,
+                               QSpinBox, QVBoxLayout)
 
 from algorithms.cohen_sutherland import (cohen_sutherland,
                                          cohen_sutherland_steps, code_text,
@@ -37,6 +38,7 @@ from algorithms.liang_barsky import liang_barsky, liang_barsky_steps
 from algorithms.midpoint_clip import midpoint_clip, midpoint_clip_steps
 from algorithms.sutherland_hodgman import (clip_segment_convex_steps,
                                            is_convex)
+from algorithms.steps import GUIDE_MOVE
 from algorithms.weiler_atherton import clip_segment_steps
 from ui.widgets import SegmentedControl
 
@@ -132,6 +134,58 @@ def _peel_fill(seeds, pool, allowed):
     return out
 
 
+def _work_shape(step):
+    """本步的紫色工作图形（算法当前判定的那一段）的两端；没有则 None。
+
+    S-H 用紫实线画"当前还在的那一段"，Liang/Cohen/Midpoint 用紫箭头画
+    端点位移，演示层还会再补一条紫虚线——统一取"最后一个紫色图形的
+    两端"，各页口径一致。
+    """
+    last = None
+    for g in step.guides:
+        if g.get("color") != GUIDE_MOVE:
+            continue
+        if g.get("kind") in ("line", "arrow"):
+            last = (g.get("a"), g.get("b"))
+    return last
+
+
+def _merge_idle_steps(steps, note_tpl="（前 {n} 步判定未改变本段，原样跳过）"):
+    """合并【空转步】：判定结果与上一帧完全相同的步不再单独出帧。
+
+    空转步 = 紫色工作图形与上一步相同 **且** 画面（像素 + 淡色）也没变
+    ——也就是"判了但这一段没被切掉"。这类步在画面上只是根橙色的
+    半平面线换了个位置，信息量极低，却把总步数撑成两三倍
+    （实测 S-H/椭圆 71 步里 44 步是空转）。
+
+    合并后：空转步消失，条数写进【下一帧】的说明里
+    （"（前 3 条半平面未切到本段）"），紫线逐条收缩的过程完整保留。
+    画面有变化的步（有像素被挖掉）永远不会被合并——挖除的时机不能动。
+    """
+    if not steps:
+        return steps
+    out = []
+    prev_work = None
+    prev_state = None
+    pending = 0
+    for st in steps:
+        work = _work_shape(st)
+        state = (tuple(st.pixels), tuple(st.tint))
+        if work is not None and prev_work is not None and work == prev_work \
+                and state == prev_state:
+            pending += 1
+            continue
+        if pending:
+            st.note = note_tpl.format(n=pending) + st.note
+            pending = 0
+        out.append(st)
+        prev_work = work
+        prev_state = state
+    if pending and out:
+        out[-1].note += note_tpl.format(n=pending)
+    return out
+
+
 class _ClipDemoBase:
     """参数卡基类：标签 + 整数微调框网格（与模块二演示页同构）。"""
 
@@ -147,12 +201,22 @@ class _ClipDemoBase:
     formula = ""
     algo = ALGO_COHEN
 
+    # 「按阶段暂停」：每判定完一段（沿图形边界的一段）自动停一下。
+    # 判定过程要逐段盯着看，整段连播根本跟不住（用户反馈："在最低速度
+    # 下感觉都比较快"）。沿用模块三分解演示页已有的机制：参数卡给一个
+    # 复选框，演示壳按 values 里的阶段键判定阶段边界。
+    stage_pausable = True
+    # 阶段键 = "段"（第 k/N 段）：正好是监视器里显示的"第几段"，
+    # 用户看到的阶段与暂停点一致。
+    stage_key = "段"
+
     def __init__(self):
         self._spins = {}
         self._canvas = None
         self._tool = None
         self._dirty = False       # 画布拖出/调整窗口 → 步骤流需重生成
         self._pinned_source = None  # 上次生成步骤流用的画布图元
+        self._pause_stage = None    # 「按阶段暂停」复选框（stage_pausable 页才有）
 
     # ---- 子类声明：[(键, 中文标签, 默认, 最小, 最大), ...] ----
     def _defs(self):
@@ -176,6 +240,13 @@ class _ClipDemoBase:
             grid.setColumnStretch(2, 1)
             self._spins[key] = sb
         lay.addLayout(grid)
+        if self.stage_pausable:
+            self._pause_stage = QCheckBox("按阶段暂停：每判定完一段自动暂停")
+            self._pause_stage.setObjectName("noRegen")   # 只影响播放，不重生成
+            self._pause_stage.setToolTip(
+                "勾上后：沿图形边界每判定完一段就自动暂停，\n"
+                "等你按播放继续走下一段（便于逐段核对判定过程）")
+            lay.addWidget(self._pause_stage)
 
     def collect(self) -> dict:
         if self._spins:
@@ -445,6 +516,10 @@ class _LineClipDemo(_ClipDemoBase):
     # 大半个图形，看不出是"沿边界一段段走"。5~6 像素两头都占。
     _PIECE_LEN = 6
 
+    # 空转步被合并后写进下一帧说明的措辞（{n} = 被合并的步数）。
+    # 默认是线段页的通用说法；逐边裁剪页换成"半平面"的说法。
+    _idle_note = "（前 {n} 步判定未改变本段，原样跳过）"
+
     def reference_pixels(self):
         """裁剪页不产出【橙色参照层】——被裁掉的部分直接显示画板颜色。
 
@@ -611,6 +686,9 @@ class _LineClipDemo(_ClipDemoBase):
                 line_guide(first_a, first_b, GUIDE_MOVE, dash=True, width=2.6)]
             st.pixels = sorted(current)
             st.tint = sorted(fill_now)
+            # 阶段键 "段"：铺垫是独立的一段（"准备"），
+            # 后面每段判定各占一段 → 「按阶段暂停」在段边界停下。
+            st.values = {**st.values, "段": "准备"}
             steps.append(st)
 
         # ---- 逐段遍历：每段跑一遍本页算法，判定完就挖掉窗口内部分 ----
@@ -651,6 +729,10 @@ class _LineClipDemo(_ClipDemoBase):
                         st.note += "（本段在窗口外，保留）"
                 if multi:
                     st.values = {**st.values, "段": f"{i + 1}/{total}"}
+                else:
+                    # 单段（直线图元）也要给阶段键，否则「按阶段暂停」
+                    # 找不到阶段边界
+                    st.values = {**st.values, "段": "1/1"}
             steps.extend(part)
 
         # ---- 末帧 = 画布真实裁剪结果（窗口外保留） ----
@@ -661,12 +743,14 @@ class _LineClipDemo(_ClipDemoBase):
         fill_now -= fill_in
         vals = dict(steps[-1].values) if steps else {}
         vals["判定"] = "完成"
+        vals["段"] = "完成"
         guide = self.window_guide(window)
         steps.append(Step(
             sorted(current), vals,
             "裁剪完成：窗口内部分已挖除，只保留窗口外",
             guides=[guide] if guide else [], tint=sorted(fill_now)))
-        return steps
+        # ---- 合并空转步（判定没改变本段的那些帧不再单独出）----
+        return _merge_idle_steps(steps, self._idle_note)
 
 
 class CohenDemo(_LineClipDemo):
@@ -677,7 +761,7 @@ class CohenDemo(_LineClipDemo):
                  "与 / 或": "与 / 或",
                  "判定": "判定", "使用边界": "本轮用的窗口边",
                  "端点0": "起点", "端点1": "终点",
-                 "交点": "新交点"}
+                 "交点": "新交点", "段": "第几段"}
     # 判定过程要逐帧盯着看：每一步都在算求交 / 二分 / 参数收窄，
     # 2 步/秒仍嫌快（用户反馈："在最低速度下感觉都比较快"）→ 默认 1 步/秒；
     # 速度滑杆还能继续调慢到 0.1 步/秒（一步 10 秒）
@@ -844,7 +928,7 @@ class MidpointDemo(CohenDemo):
                  "端点0": "起点", "端点1": "终点",
                  "中点": "中点 M", "中点码": "M 区域码",
                  "区间": "区间长度", "轮次": "二分轮次",
-                 "当前": "当前在求哪端"}
+                 "当前": "当前在求哪端", "段": "第几段"}
     formula = ("中点分割裁剪（Midpoint Subdivision）\n"
                "区域码判定与 Cohen 相同：\n"
                "  或 = 0000 → 接受；与 ≠ 0000 → 舍弃\n"
@@ -866,7 +950,8 @@ class LiangDemo(_LineClipDemo):
     icon = "fit"
     algo = ALGO_LIANG
     variables = {"阶段": "阶段", "边界": "当前边界",
-                 "p": "p", "q": "q", "u0": "u0", "u1": "u1"}
+                 "p": "p", "q": "q", "u0": "u0", "u1": "u1",
+                 "段": "第几段"}
     # 判定过程要逐帧盯着看：每一步都在算求交 / 二分 / 参数收窄，
     # 2 步/秒仍嫌快（用户反馈："在最低速度下感觉都比较快"）→ 默认 1 步/秒；
     # 速度滑杆还能继续调慢到 0.1 步/秒（一步 10 秒）
@@ -1193,6 +1278,9 @@ class PolygonClipDemo(_PolyClipDemo):
             return True
         return is_convex([(float(x), float(y)) for x, y in v])
 
+    # 逐边裁剪的空转步 = "这条半平面没切到本段"，措辞换成半平面说法
+    _idle_note = "（前 {n} 条半平面未切到本段）"
+
     def _steps(self, x0, y0, x1, y1, window):
         """这一段逐半平面切分（凸窗口）。"""
         return clip_segment_convex_steps((float(x0), float(y0)),
@@ -1284,7 +1372,7 @@ class PolygonClipWADemo(_PolyClipDemo):
 
         steps = [Step(sorted(current),
                        {"阶段": "初始", "判定": "准备", "本段": "-",
-                        "进入点": "-", "离开点": "-", "段": "0"},
+                        "进入点": "-", "离开点": "-", "段": "准备"},
                        "准备：交集边界由【图形边】与【裁剪窗口边】交替组成，"
                        "下面一段一段交替走一遍",
                        guides=list(base_guides), tint=sorted(fill_now))]
@@ -1348,12 +1436,12 @@ class PolygonClipWADemo(_PolyClipDemo):
         current -= fill_in
         fill_now -= fill_in
         vals = dict(steps[-1].values) if steps else {}
-        vals.update({"阶段": "完成", "判定": "完成", "段": f"{total}/{total}"})
+        vals.update({"阶段": "完成", "判定": "完成", "段": "完成"})
         steps.append(Step(sorted(current), vals,
                            "裁剪完成：交集边界 = 图形边的部分 + 窗口边的部分"
                            "（两类边交替）",
                            guides=list(base_guides), tint=sorted(fill_now)))
-        return steps
+        return _merge_idle_steps(steps, self._idle_note)
 
 
 # =====================================================================

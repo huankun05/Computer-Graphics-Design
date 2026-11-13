@@ -763,6 +763,103 @@ def check_wa_alternating_path():
     cv.close()
 
 
+def _work_shape(step):
+    """本步的紫色工作图形（算法当前判定的那一段）的两端；没有则 None。
+
+    与实现里的同名函数口径一致，但守卫自己写一遍（不 import 实现里的
+    新函数），保证旧代码上也能跑出红色。
+    """
+    from algorithms.steps import GUIDE_MOVE
+    last = None
+    for g in step.guides:
+        if g.get("color") != GUIDE_MOVE:
+            continue
+        if g.get("kind") in ("line", "arrow"):
+            last = (g.get("a"), g.get("b"))
+    return last
+
+
+def _stage_ord(value, total):
+    """阶段值 → 序号（"准备"=0，"k/N"=k，"完成"=total+1）；无法解析返回 None。"""
+    if value in (None, ""):
+        return None
+    s = str(value)
+    if s == "准备":
+        return 0
+    if s == "完成":
+        return total + 1
+    try:
+        return int(s.split("/")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def check_merge_and_stage():
+    """C15/C16：裁剪页的【步数合并】与【阶段键】。
+
+    用户反馈（2026-11-13）：S-H 页 64 步太碎。
+
+    合并规则（用户选定）：只删【空转步】——判定结果与上一帧完全相同
+    （画面没变、算法当前判定的那一段也没变）的帧不再单独出帧，条数写进
+    下一帧的说明里；紫线逐条收缩的过程完整保留。
+
+    守卫断言：
+      · 任何两个相邻帧不允许"画面 + 判定对象"完全相同
+        —— 空转步没删干净，步数就下不来（旧实现 S-H/椭圆 71 步）；
+      · 每帧都有阶段键 "段"，且阶段序号单调不减；
+      · 阶段边界就是段边界（「按阶段暂停」的落点）。
+    """
+    for page_name, demo_cls, is_line in PAGES:
+        for sname, make_shape in SUBJECTS:
+            if not is_line and sname == "直线":
+                continue
+            shape = make_shape()
+            cv = CanvasView()
+            cv.document.shapes.append(shape)
+            cv._render_base()
+            demo = demo_cls()
+            demo._canvas = cv
+            demo._spins = {}
+            steps = demo.make_steps(demo.collect())
+            tag = f"{page_name}/{sname}"
+            cv.close()
+            if not steps:
+                ok(False, f"{tag}: 未生成步骤流")
+                continue
+
+            # ---- C15：相邻帧不得"画面 + 判定对象"完全重复 ----
+            dup = 0
+            for i in range(len(steps) - 1):
+                a, b = steps[i], steps[i + 1]
+                wa, wb = _work_shape(a), _work_shape(b)
+                if a.pixels == b.pixels and a.tint == b.tint \
+                        and wa is not None and wa == wb:
+                    dup += 1
+            ok(dup == 0,
+               f"{tag}: 有 {dup} 组相邻帧画面与判定对象完全相同"
+               f"（空转步没合并，步数下不来）")
+
+            # ---- C16：阶段键完整、单调 ----
+            key = getattr(demo_cls, "stage_key", "段")
+            segs = [st.values.get(key) for st in steps]
+            missing = [i for i, s in enumerate(segs) if s in (None, "")]
+            ok(not missing,
+               f"{tag}: {len(missing)} 帧缺阶段键 '{key}'（按阶段暂停会失效）")
+            total = 0
+            for s in segs:
+                if s and "/" in str(s):
+                    try:
+                        total = max(total, int(str(s).split("/")[1]))
+                    except (ValueError, IndexError):
+                        pass
+            ords = [_stage_ord(s, total) for s in segs]
+            ok(all(o is not None for o in ords),
+               f"{tag}: 阶段值无法解析成序号（{sorted(set(map(str, segs)))[:6]}）")
+            known = [o for o in ords if o is not None]
+            ok(all(known[i] <= known[i + 1] for i in range(len(known) - 1)),
+               f"{tag}: 阶段序号不是单调不减（{known}）")
+
+
 def check_polygon_window():
     """C12：多边形窗口（画一个多边形区域去裁剪）必须与真实裁剪同口径。
 
@@ -945,6 +1042,10 @@ check_exact_intersection()
 print("-" * 64)
 print("双边裁剪：交替路径不得反复播放同一段")
 check_wa_alternating_path()
+
+print("-" * 64)
+print("裁剪页：空转步必须合并干净 + 阶段键完整")
+check_merge_and_stage()
 
 print("-" * 64)
 print("多边形窗口：画一个多边形区域去裁剪")

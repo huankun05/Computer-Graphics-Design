@@ -1035,8 +1035,13 @@ class DemoView(QWidget):
     def _maybe_pause_at_stage(self, index: int):
         """「按阶段暂停」：当前帧是某阶段最后一帧时自动暂停。
 
-        阶段名取自步骤的 values["阶段"]（下一帧换名即本阶段结束）；
+        阶段名取自步骤的 values 里的【阶段键】（下一帧换名即本阶段结束）；
         只在播放状态生效，手动单步/拖动不受影响。
+
+        阶段键由演示页自己声明（stage_key）：
+          · 模块三（分解演示）用 "阶段"（T(-c) / S / R / …）；
+          · 模块四（裁剪）用 "段"（第 k/N 段，即沿图形边界判定完一段）——
+            正好与监视器里显示的"第几段"是同一个值，用户看到的一致。
         """
         demo = self.current_demo
         cb = getattr(demo, "_pause_stage", None)
@@ -1045,8 +1050,8 @@ class DemoView(QWidget):
         steps = self.player.steps
         if index < 0 or index + 1 >= len(steps):
             return
-        if steps[index].values.get("阶段") != \
-                steps[index + 1].values.get("阶段"):
+        key = getattr(demo, "stage_key", "阶段")
+        if steps[index].values.get(key) != steps[index + 1].values.get(key):
             self.player.pause()
 
     def _sync_reference(self, index: int):
@@ -1077,8 +1082,14 @@ class DemoView(QWidget):
 
     def _update_progress(self, index: int):
         n = len(self.player.steps)
-        self.progress_label.setText(
-            f"第 {index + 1 if index >= 0 else 0} / {n} 步")
+        txt = f"第 {index + 1 if index >= 0 else 0} / {n} 步"
+        steps = self.player.steps
+        if 0 <= index < len(steps):
+            key = getattr(self.current_demo, "stage_key", "阶段")
+            stage = steps[index].values.get(key)
+            if stage:
+                txt += f"　·　{stage}"
+        self.progress_label.setText(txt)
 
     # 演示模式内空格 = 播放/暂停（画布的空格平移在演示页让位）
     def keyPressEvent(self, e):
