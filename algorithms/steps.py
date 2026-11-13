@@ -47,18 +47,28 @@ GUIDE_HIT = "#3E63DD"      # 算法产出/交点（蓝）
 GUIDE_MOVE = "#7C3AED"     # 线段/图形自身的变化（紫）：端点移动、当前处理的边
 
 
+def _r2(p) -> Pixel:
+    """坐标 → 整数像素（四舍五入）。
+
+    注记坐标允许带小数：多边形裁剪的交点是精确解（16.62, 10.38 这种），
+    画到像素格上必须四舍五入。用 int() 截断会把每个交点整体拉低半格，
+    看上去像交点算错了（实测裁剪面积差 2.7%）。
+    """
+    return (int(round(float(p[0]))), int(round(float(p[1]))))
+
+
+
 def point_guide(xy: Pixel, label: str = "", color: str = GUIDE_HIT) -> dict:
     """点注记（交点、端点、轴心、映射点）。"""
-    return {"kind": "point", "xy": (int(xy[0]), int(xy[1])),
+    return {"kind": "point", "xy": _r2(xy),
             "label": label, "color": color}
 
 
 def line_guide(a: Pixel, b: Pixel, color: str = GUIDE_REF,
                dash: bool = True, width: float = 1.6) -> dict:
     """线注记（边界线、连线、扫描线）。width 可加粗用于"当前处理的那条边"。"""
-    return {"kind": "line", "a": (int(a[0]), int(a[1])),
-            "b": (int(b[0]), int(b[1])), "color": color, "dash": dash,
-            "width": float(width)}
+    return {"kind": "line", "a": _r2(a), "b": _r2(b),
+            "color": color, "dash": dash, "width": float(width)}
 
 
 def boundary_guide(a: Pixel, b: Pixel, color: str = GUIDE_REF,
@@ -124,16 +134,26 @@ def rect_guide(xy: Tuple[int, int, int, int],
 
 
 def polygon_guide(points, color: str = GUIDE_HIT, dash: bool = True,
-                  width: float = 2.2) -> dict:
+                  width: float = 2.2, anchor: str = "center") -> dict:
     """多边形轮廓注记（Sutherland-Hodgman 的"当前结果多边形"）。
 
     与 Step.pixels 分离：逐边裁剪的中间多边形是算法的演算产物，
     若混进像素，演示层就会与"原图像素"求交而被整段过滤掉
     （用户反馈：看不到逐顶点生长的过程）。顶点按格心绘制，首尾自动闭合。
+
+    顶点允许带小数（几何出口是精确交点时就是小数）：必须【四舍五入】
+    而不是截断——截断会把 (16.62, 10.38) 砍成 (16, 10)，整体偏移半格，
+    看上去像交点算错了。
+
+    anchor="center"：顶点画在格心（算法的中间多边形用这个——它是
+        几何意义上的多边形，边压在像素格中央才看得出形状）；
+    anchor="corner"：顶点画在格角（裁剪窗口用这个——画布上裁剪工具
+        的红框就是按格角画的，两边重合才不会出现"两重窗口框"）。
     """
     return {"kind": "polygon",
-            "points": [(int(p[0]), int(p[1])) for p in points],
-            "color": color, "dash": dash, "width": float(width)}
+            "points": [_r2(p) for p in points],
+            "color": color, "dash": dash, "width": float(width),
+            "anchor": anchor}
 
 
 def label_guide(xy: Pixel, text: str, color: str = GUIDE_REF,
@@ -145,7 +165,7 @@ def label_guide(xy: Pixel, text: str, color: str = GUIDE_REF,
     默认保持旧行为（锚点右侧、格子之上）；分区标签用 center+middle
     才能真正居中在区域里，边界名用 right/left 才能贴边而不压到窗口。
     """
-    return {"kind": "label", "xy": (int(xy[0]), int(xy[1])),
+    return {"kind": "label", "xy": _r2(xy),
             "text": str(text), "color": color,
             "align": align, "valign": valign}
 

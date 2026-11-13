@@ -500,9 +500,9 @@ expect(True, "网格前景层绘制 + 800% 极限缩放无死循环")
 
 # 7.2 演示页加载
 demo_view = win.demo_view
-expect(len(demo_view._all_pages) == 17,
+expect(len(demo_view._all_pages) == 18,
        f"演示页 {len(demo_view._all_pages)} 个"
-       "（模块一 3 + 模块二 6 + 变换 4 + 裁剪 4）")
+       "（模块一 3 + 模块二 6 + 变换 4 + 裁剪 5）")
 from modules.module02_primitives.demos import (CircleDemo, LineDemo,
                                                CompareDemo, PolygonDemo, FillDemo)
 gd = next(d for d in demo_view._all_pages if isinstance(d, CompareDemo))

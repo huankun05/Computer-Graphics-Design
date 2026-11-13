@@ -521,6 +521,10 @@ class DemoView(QWidget):
                 elif isinstance(w, QCheckBox):
                     w.toggled.connect(
                         lambda _c=False: self._regen_timer.start())
+                elif hasattr(w, "changed") and hasattr(w, "set_current"):
+                    # 分段控件（裁剪页的"矩形窗口 / 多边形窗口"切换）：
+                    # 换了窗口形状，步骤流必须按新形状重生成
+                    w.changed.connect(lambda _i=0: self._regen_timer.start())
         self.formula_label.setText(_rich_text(demo.formula, "150%"))
         fmat = getattr(demo, "formula_matrix", None)
         self.formula_matrix.setVisible(fmat is not None)
@@ -1038,13 +1042,16 @@ class DemoView(QWidget):
         return hasattr(self.current_demo, "subject_kind")
 
     def _clip_rect_now(self):
-        """当前裁剪演示页的窗口矩形（参数卡口径，闭区间）。
+        """当前裁剪演示页的窗口标识（参数卡口径，闭区间）。
 
         与 _finish_clip_playback 真正落地的那次裁剪同一口径，用来判断
         「这次是重播上一轮」还是「换了个窗口做第二次裁剪」。
+        矩形与多边形窗口统一成顶点列表的元组（demo.window_key）。
         """
         demo = self.current_demo
-        getter = getattr(demo, "window_rect", None)
+        getter = getattr(demo, "window_key", None)
+        if not callable(getter):
+            getter = getattr(demo, "window_rect", None)
         if not callable(getter):
             return None
         try:
@@ -1094,13 +1101,13 @@ class DemoView(QWidget):
         """
         demo = self.current_demo
         tool = getattr(self.canvas, "tool", None)
-        rect = None
-        getter = getattr(demo, "window_rect", None)
+        window = None
+        getter = getattr(demo, "window_vertices", None)
         if callable(getter):
             try:
-                rect = tuple(getter())
+                window = [tuple(p) for p in getter()]
             except (KeyError, ValueError):
-                rect = None
+                window = None
         # 裁剪只处理可见图元
         self._restore_replay_shapes()
         src = None
@@ -1108,22 +1115,27 @@ class DemoView(QWidget):
         if callable(src_getter):
             src = src_getter()
         entries = []
-        if (tool is not None and rect is not None and src is not None
-                and hasattr(tool, "apply_crop")):
-            # 让工具窗口 = 动画窗口：画布红框、裁剪结果、动画三者同一窗口
-            tool.rect = rect
-            tool._mask_key = None
-            if hasattr(tool, "_sync_spins"):
-                tool._sync_spins()
+        if (tool is not None and window and len(window) >= 3
+                and src is not None and hasattr(tool, "apply_crop")):
+            # 让工具窗口 = 动画窗口：画布红框/多边形轮廓、裁剪结果、
+            # 动画三者同一窗口
+            sync = getattr(demo, "sync_tool_window", None)
+            if callable(sync):
+                sync(tool)
+            else:
+                xs = [p[0] for p in window]
+                ys = [p[1] for p in window]
+                tool.rect = (min(xs), min(ys), max(xs), max(ys))
+                tool._mask_key = None
             tool._hook_applying = True
             try:
-                entries = tool.apply_crop([src], rect, keep_window=False) or []
+                entries = tool.apply_crop([src], window, keep_window=False) or []
             finally:
                 tool._hook_applying = False
         demo._last_clip_entries = [(s, b) for s, b, _a in entries]
         # 记下这一轮真正落地的窗口：下次重播时据此判断"是不是同一轮"
         # （同一轮 → 还原快照重演；换了窗口 → 新的一次裁剪，结果累积）
-        demo._last_clip_rect = tuple(rect) if rect is not None else None
+        demo._last_clip_rect = tuple(window) if window else None
         msg = getattr(tool, "_msg_text", "") if tool is not None else ""
         # 叠层/注记/红框全部清掉，画面只剩真实裁剪后的图元
         self.canvas.demo.reset()
@@ -1157,32 +1169,38 @@ class DemoView(QWidget):
         if demo is None or tool is None or \
                 not hasattr(demo, "subject_kind"):
             return False
-        rect = getattr(tool, "rect", None)
-        if rect is None:                # 无窗口/多边形窗口：演示页不接管
-            return False
+        # 窗口（矩形或多边形，统一成顶点列表）
+        window = []
+        win_getter = getattr(tool, "window_vertices", None)
+        if callable(win_getter):
+            try:
+                window = [tuple(p) for p in win_getter()]
+            except Exception:
+                window = []
+        if len(window) < 3:
+            return False                # 没有窗口：演示页不接管
         # 动画对象 = 即将被挖除的图元：_pinned_source 会记住上次演示的对象，
         # A 裁完再框 B 时若不改钉，动画还在 A 上、挖的却是 B（用户反馈）。
         # 取窗口实际命中的最上层可见图元钉住；窗口内没有可挖对象则不接管，
         # 让工具直接给出"没有可挖除像素"的提示，而不是空播一场动画。
         get_subjects = getattr(demo, "subject_shapes", None)
         if callable(get_subjects):
+            from algorithms.window_mask import polygon_mask
             from core.rasterizer import rasterize
-            x0, y0, x1, y1 = rect
+            mask = polygon_mask(window)
             hit = None
             for s in get_subjects():        # 越靠后画的越上层，取最后命中者
                 outline, fill = rasterize(s)
-                if any(x0 <= px <= x1 and y0 <= py <= y1
-                       for px, py in outline) or \
-                   any(x0 <= px <= x1 and y0 <= py <= y1
-                       for px, py in fill):
+                if any((int(px), int(py)) in mask for px, py in outline) or \
+                   any((int(px), int(py)) in mask for px, py in fill):
                     hit = s
             if hit is None:
                 return False
             demo._pinned_source = hit
-        # 画布红框窗口 → 静默回填参数卡，保证"动画窗口 = 即将挖除的窗口"
+        # 画布窗口 → 静默回填参数卡，保证"动画窗口 = 即将挖除的窗口"
         notify = getattr(demo, "_on_canvas_window", None)
         if callable(notify):
-            notify(tuple(rect))
+            notify(window)
             consume = getattr(demo, "consume_dirty", None)
             if callable(consume):
                 consume()

@@ -351,11 +351,14 @@ class PixelLayer:
             elif kind == "polygon":
                 # 当前结果多边形（S-H 的中间多边形）：按格心闭合折线绘制。
                 # 与 Step.pixels 分离，不会被"原图像素"求交过滤掉。
+                # anchor="corner" 时画在格角——裁剪窗口用它，才能和画布上
+                # 裁剪工具的红框完全重合（否则是两重错开半格的窗口框）。
                 pts = g.get("points") or []
                 if len(pts) < 2:
                     continue
+                off = SIM / 2 if g.get("anchor", "center") == "corner" else 0.0
                 poly = QPolygonF([
-                    QPointF(p[0] * SIM + SIM / 2, p[1] * SIM + SIM / 2)
+                    QPointF(p[0] * SIM + off, p[1] * SIM + off)
                     for p in pts])
                 painter.setBrush(Qt.NoBrush)
                 painter.setPen(QPen(color, float(g.get("width") or 2.2),

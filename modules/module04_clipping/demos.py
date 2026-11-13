@@ -4,8 +4,8 @@
  modules/module04_clipping/demos.py — 模块四演示页（区域裁剪）
 =====================================================================
 三页线段裁剪（Cohen-Sutherland / 中点分割 / Liang-Barsky）
-+ 一页多边形裁剪（Sutherland-Hodgman）。
-每页 = 参数卡（窗口四边）+ 公式卡 + 决策项监视 + 播放控制，
++ 两页多边形裁剪（Sutherland-Hodgman 逐边 / Weiler-Atherton 双边）。
+每页 = 参数卡（窗口）+ 公式卡 + 决策项监视 + 播放控制，
 步骤流来自 algorithms/* 的 *_steps()（与真实裁剪函数共用同一套判定）。
 
 演示对象 = 画布上选中（或最后画的）图元，动画沿它的【边界逐段遍历】，
@@ -18,22 +18,34 @@
     每 5~6 个相邻像素切一段（段首尾连成直线，轨迹贴着原轮廓）。
 画布上没有可用图元时只提示，不生成任何内置示例。
 演示页不对画布手绘图元做回放（freehand_replay=False）。
+
+★ 多边形裁剪两页的窗口可以是【矩形】也可以是【画出来的多边形区域】：
+  参数卡顶上切"矩形窗口 / 多边形窗口"，多边形窗口直接在演示画布上
+  逐点单击布点（点回起点 / 右键 / Enter 闭合），窗口即参与判定。
+  · 逐边裁剪（S-H）：窗口必须**凸**（半平面的交才能表示凸窗口）；
+  · 双边裁剪（W-A）：窗口可以是任意简单多边形（凹的也行）——
+    这正是它相对 S-H 的关键优势，两页并列看差异最直观。
 =====================================================================
 """
 
-from PySide6.QtWidgets import QGridLayout, QLabel, QSpinBox, QVBoxLayout
+from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QSpinBox, QVBoxLayout
 
 from algorithms.cohen_sutherland import (cohen_sutherland,
                                          cohen_sutherland_steps, code_text,
                                          region_code)
 from algorithms.liang_barsky import liang_barsky, liang_barsky_steps
 from algorithms.midpoint_clip import midpoint_clip, midpoint_clip_steps
-from algorithms.sutherland_hodgman import clip_polygon_steps
+from algorithms.sutherland_hodgman import (clip_segment_convex_steps,
+                                           is_convex)
+from algorithms.weiler_atherton import (clip_segment_steps,
+                                         clip_window_segments)
+from ui.widgets import SegmentedControl
 
 ALGO_COHEN = "cohen_sutherland"
 ALGO_MIDPOINT = "midpoint"
 ALGO_LIANG = "liang_barsky"
 ALGO_HODGMAN = "sutherland_hodgman"
+ALGO_WEILER = "weiler_atherton"
 
 # Cohen 的 9 个区域：窗口内 + 四边 + 四角（键 = 4 位区域码的十进制值）
 REGION_CN = {0: "窗口内", 1: "左", 2: "右", 4: "上", 8: "下",
@@ -156,8 +168,81 @@ class _ClipDemoBase:
         挖除按画布红框走，结果会错位。
         """
         p = self.collect()
+        return self._rect_of(p)
+
+    @staticmethod
+    def _rect_of(p):
         return (min(p["wx0"], p["wx1"]), min(p["wy0"], p["wy1"]),
                 max(p["wx0"], p["wx1"]), max(p["wy0"], p["wy1"]))
+
+    def window_vertices(self, params=None):
+        """当前裁剪窗口 → 顶点列表（整数像素，世界坐标）。
+
+        矩形窗口 → 4 个角点；多边形窗口 → 画布上画出来的顶点（见
+        _PolyClipDemo）。统一成"多边形"口径之后，窗口内判定、掩膜、
+        算法窗口全都走同一套，演示页挖掉的像素与应用模式（ClipTool 用
+        polygon_mask）逐像素一致。
+        """
+        p = params if params is not None else self.collect()
+        x0, y0, x1, y1 = self._rect_of(p)
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+    @staticmethod
+    def _bbox(window):
+        """窗口顶点 → 包围盒矩形 (x0, y0, x1, y1)。"""
+        xs = [p[0] for p in window]
+        ys = [p[1] for p in window]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def window_mask(self, window=None):
+        """窗口覆盖的像素集合（与应用模式同一套 polygon_mask）。
+
+        矩形窗口的掩膜 = 闭区间矩形（已逐像素核对过与旧口径一致），
+        多边形窗口则是任意（含凹）多边形的扫描线掩膜。
+        """
+        from algorithms.window_mask import polygon_mask
+        v = self.window_vertices() if window is None else window
+        if len(v) < 3:
+            return set()
+        return polygon_mask([(int(x), int(y)) for x, y in v])
+
+    def window_guide(self, window=None):
+        """窗口边框注记（矩形窗口画红框，多边形窗口画青色虚线轮廓）。"""
+        from algorithms.steps import rect_guide
+        v = self.window_vertices() if window is None else window
+        if len(v) < 3:
+            return None
+        return rect_guide((min(p[0] for p in v), min(p[1] for p in v),
+                           max(p[0] for p in v), max(p[1] for p in v)))
+
+    def window_key(self):
+        """窗口标识：用来判断"重播同一轮"还是"新的一次操作"。
+
+        矩形与多边形统一成顶点列表的元组——同一份窗口重播 → 还原快照
+        重演；换了窗口 → 新的一次裁剪，结果必须累积（用户反馈：
+        "我不能在同一个图形上面进行两次操作，第二次操作会覆盖第一次"）。
+        """
+        return tuple(self.window_vertices())
+
+    def sync_tool_window(self, tool):
+        """把演示页当前的窗口同步到画布上的裁剪工具。
+
+        播完动画要真正落地裁剪时，画布上的窗口（红框 / 多边形轮廓）
+        必须与动画用的窗口是同一个，否则"看到什么"和"裁掉什么"对不上。
+        """
+        from modules.module04_clipping.tools import MODE_POLY, MODE_RECT
+        verts = self.window_vertices()
+        if len(verts) < 3:
+            return
+        if getattr(self, "window_kind", "rect") == "poly":
+            tool.mode = MODE_POLY
+            tool.poly = list(verts)
+            tool.rect = None
+        else:
+            tool.mode = MODE_RECT
+            tool.rect = self.window_rect()
+        tool._mask_key = None
+        tool._refresh_ui()
 
     def all_pixels(self, rect, src=None):
         """当前演示对象的全部像素（轮廓 + 填充）。"""
@@ -170,7 +255,7 @@ class _ClipDemoBase:
         outline, fill = rasterize(src)
         return {(int(x), int(y)) for x, y in list(outline) + list(fill)}
 
-    def kept_pixels(self, rect, src=None):
+    def kept_pixels(self, window, src=None):
         """窗口【外】保留下来的图元像素（动画末帧与播完真实裁剪的唯一口径）。
 
         本模块的"区域裁剪"= 裁去窗口内、保留窗口外（与 ClipTool 面板
@@ -181,17 +266,16 @@ class _ClipDemoBase:
         也不能用"裁剪后端点重画一条线段"：缓坡长线逐列 y 会偏，实证末帧
         与画布结果差 16 个像素，播完那一瞬画面会跳（用户反馈）。
         """
-        x0, y0, x1, y1 = rect
-        return sorted({p for p in self.all_pixels(rect, src)
-                       if not (x0 <= p[0] <= x1 and y0 <= p[1] <= y1)})
+        mask = self.window_mask(window)
+        return sorted({p for p in self.all_pixels(window, src)
+                       if p not in mask})
 
-    def cut_pixels(self, rect, src=None):
+    def cut_pixels(self, window, src=None):
         """窗口【内】将被裁掉的像素（轮廓 + 填充）——橙色参照层。"""
-        x0, y0, x1, y1 = rect
-        return {p for p in self.all_pixels(rect, src)
-                if x0 <= p[0] <= x1 and y0 <= p[1] <= y1}
+        mask = self.window_mask(window)
+        return {p for p in self.all_pixels(window, src) if p in mask}
 
-    def kept_fill_pixels(self, rect):
+    def kept_fill_pixels(self, window):
         """窗口【外】的填充像素：动画每一步都常显（这部分不会被裁掉）。
 
         必须扣掉轮廓像素：span/scanline 填充的两端就落在轮廓上，
@@ -204,10 +288,9 @@ class _ClipDemoBase:
             return set()
         outline, fill = rasterize(src)
         edge = {(int(x), int(y)) for x, y in outline}
-        x0, y0, x1, y1 = rect
+        mask = self.window_mask(window)
         return {(int(x), int(y)) for x, y in fill
-                if (int(x), int(y)) not in edge
-                and not (x0 <= x <= x1 and y0 <= y <= y1)}
+                if (int(x), int(y)) not in edge and (int(x), int(y)) not in mask}
 
     # ---- 演示对象 = 画布图元（选中优先 / 最后画的），不再内置示例 ----
     subject_kind = "any"           # any = 任意图元；closed = 只要封闭图形
@@ -252,7 +335,7 @@ class _ClipDemoBase:
         return ("画布上没有图元：先画直线、圆、椭圆或多边形，"
                 "播放即演示它的裁剪")
 
-    def cut_fill_pixels(self, rect):
+    def cut_fill_pixels(self, window):
         """窗口【内】的填充像素（轮廓除外）——随轮廓一起被挖除。
 
         真实裁剪擦掉的是"轮廓∪填充"中落在窗口内的部分；轮廓被挖穿时，
@@ -266,10 +349,9 @@ class _ClipDemoBase:
             return set()
         outline, fill = rasterize(src)
         edge = {(int(x), int(y)) for x, y in outline}
-        x0, y0, x1, y1 = rect
+        mask = self.window_mask(window)
         return {(int(x), int(y)) for x, y in fill
-                if (int(x), int(y)) not in edge
-                and x0 <= x <= x1 and y0 <= y <= y1}
+                if (int(x), int(y)) not in edge and (int(x), int(y)) in mask}
 
     # ---- 页面联动：选中本页即切到裁剪工具 ----
     def tool_selector(self, canvas):
@@ -286,15 +368,27 @@ class _ClipDemoBase:
             tool = ClipTool(canvas)
             canvas.set_tool(tool)
         tool.preview_only = True
+        # 线段裁剪页的窗口只能是矩形：切页回来时把工具从"多边形窗口"
+        # 模式切回去，否则画布上留着一个上一页的多边形窗口
+        from modules.module04_clipping.tools import MODE_RECT
+        tool.mode = MODE_RECT
         tool.window_changed = self._on_canvas_window
         self._canvas = canvas
         self._tool = tool
 
-    def _on_canvas_window(self, rect):
-        """画布拖出的矩形窗口 → 静默回填参数卡（不触发防抖自动播放）。"""
-        x0, y0, x1, y1 = rect
-        for key, val in (("wx0", x0), ("wy0", y0),
-                         ("wx1", x1), ("wy1", y1)):
+    def _on_canvas_window(self, window):
+        """画布上确定的窗口 → 静默回填参数卡（不触发防抖自动播放）。
+
+        window 是窗口的**顶点列表**（矩形 = 4 个角点，多边形 = 画出来的
+        顶点）。线段页只有矩形窗口，把包围盒回填到 wx0/wy0/wx1/wy1 即可；
+        多边形页的窗口直接来自画布，不需要回填（见 _PolyClipDemo）。
+        """
+        if not window:
+            return
+        xs = [p[0] for p in window]
+        ys = [p[1] for p in window]
+        for key, val in (("wx0", min(xs)), ("wy0", min(ys)),
+                         ("wx1", max(xs)), ("wy1", max(ys))):
             sb = self._spins.get(key)
             if sb is None:
                 continue
@@ -338,7 +432,7 @@ class _LineClipDemo(_ClipDemoBase):
         src = self.playback_source()
         if src is None:
             return []
-        return sorted(self.cut_pixels(self._rect(self.collect()), src))
+        return sorted(self.cut_pixels(self.window_vertices(self.collect()), src))
 
     def _defs(self):
         return [("wx0", "窗口左", 20, -20, 120), ("wy0", "窗口上", 12, -20, 80),
@@ -427,7 +521,7 @@ class _LineClipDemo(_ClipDemoBase):
                 i = j
         return out
 
-    def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
+    def _prelude_steps(self, a, b, window, multi=False, full_px=None):
         """判定动画的铺垫步骤（区域划分/端点判定等）；子类按需覆盖。
 
         a, b = 第一段的两个端点；multi = 逐段遍历（端点编码交给各段
@@ -452,32 +546,35 @@ class _LineClipDemo(_ClipDemoBase):
         pieces = self._segments()
         if not pieces:
             return []
-        rect = self._rect(params)
+        window = self.window_vertices(params)
+        mask = self.window_mask(window)
+        if not mask:
+            return []
         total = len(pieces)
         multi = total > 1
-        x0, y0, x1, y1 = rect
 
         def inside(p):
-            """窗口内？（与 ClipTool.apply_crop 的闭区间判定一致）"""
-            return x0 <= p[0] <= x1 and y0 <= p[1] <= y1
+            """窗口内？（与应用模式的 polygon_mask 同一口径）"""
+            return p in mask
 
         # 起始状态 = 图元真实像素（轮廓 + 填充）
-        current = set(self.all_pixels(rect))
+        current = set(self.all_pixels(window))
         # tint = 【全部】填充像素（轮廓除外），窗口内窗口外都算：
         # 之前只取窗口外的填充，窗口内的填充就落进了"主色"组，
         # 和轮廓画成同一个颜色 —— 整块图元一片蓝，边框根本分不出来
         # （用户反馈："边框和填充弄成一个颜色了，展示不出来"）。
         # 判定挖除时再把窗口内那部分一起从 current / fill_now 里扣掉。
-        fill_in = self.cut_fill_pixels(rect)                  # 窗口内填充（待挖除）
-        fill_now = set(self.kept_fill_pixels(rect)) | fill_in  # 全部填充像素（淡色）
+        fill_in = self.cut_fill_pixels(window)              # 窗口内填充（待挖除）
+        fill_now = set(self.kept_fill_pixels(window)) | fill_in  # 全部填充（淡色）
 
-        from algorithms.steps import (GUIDE_MOVE, Step, line_guide, rect_guide)
+        from algorithms.steps import (GUIDE_MOVE, Step, line_guide,
+                                      rect_guide)
         steps = []
 
         # ---- 铺垫：9 区划分 / 边界说明，只讲一次 ----
         first_a, first_b, _owned = pieces[0]
-        prelude = self._prelude_steps(first_a, first_b, rect, multi,
-                                      set(self.all_pixels(rect)))
+        prelude = self._prelude_steps(first_a, first_b, window, multi,
+                                      set(self.all_pixels(window)))
         for st in prelude:
             st.guides = list(st.guides) + [
                 line_guide(first_a, first_b, GUIDE_MOVE, dash=True, width=2.6)]
@@ -487,7 +584,7 @@ class _LineClipDemo(_ClipDemoBase):
 
         # ---- 逐段遍历：每段跑一遍本页算法，判定完就挖掉窗口内部分 ----
         for i, (a, b, owned) in enumerate(pieces):
-            part = self._steps(a[0], a[1], b[0], b[1], rect)
+            part = self._steps(a[0], a[1], b[0], b[1], window)
             if not part:
                 continue
             cut = {p for p in owned if inside(p)}
@@ -529,10 +626,11 @@ class _LineClipDemo(_ClipDemoBase):
         fill_now -= fill_in
         vals = dict(steps[-1].values) if steps else {}
         vals["判定"] = "完成"
+        guide = self.window_guide(window)
         steps.append(Step(
             sorted(current), vals,
             "裁剪完成：窗口内部分已挖除，只保留窗口外",
-            guides=[rect_guide(rect)], tint=sorted(fill_now)))
+            guides=[guide] if guide else [], tint=sorted(fill_now)))
         return steps
 
 
@@ -559,12 +657,14 @@ class CohenDemo(_LineClipDemo):
                "③ 否则取外端点求交，清 1 位重判\n"
                "每轮至少清 1 位，最多 4 轮")
 
-    def _steps(self, *args):
-        return cohen_sutherland_steps(*args)
+    def _steps(self, x0, y0, x1, y1, window):
+        """一段的判定步骤。window 是窗口顶点列表；线段算法要矩形，
+        取包围盒即可（线段页的窗口本来就是矩形）。"""
+        return cohen_sutherland_steps(x0, y0, x1, y1, self._bbox(window))
 
     _clip_fn = staticmethod(cohen_sutherland)
 
-    def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
+    def _prelude_steps(self, a, b, window, multi=False, full_px=None):
         """判定铺垫：① 窗口四边延长成 9 区逐区标码；②③ 端点逐个判区编码。
 
         逐段遍历（multi）时只做区域划分：端点编码交给各段自己的步骤——
@@ -576,7 +676,8 @@ class CohenDemo(_LineClipDemo):
         from algorithms.steps import (GUIDE_MARK, Step, boundary_guide,
                                       border_extension_segments, label_guide,
                                       point_guide, rect_guide)
-        rx0, ry0, rx1, ry1 = rect
+        rx0, ry0, rx1, ry1 = self._bbox(window)
+        rect = (rx0, ry0, rx1, ry1)
         ox1, oy1 = rx1 + 1, ry1 + 1          # 闭区间 → 连续外边界
         m = 5                                 # 区域展示向窗口外扩的格数
         bx0, by0, bx1, by1 = rx0 - m, ry0 - m, ox1 + m, oy1 + m
@@ -719,8 +820,8 @@ class MidpointDemo(CohenDemo):
                "区间 ≤ 1 像素即达显示分辨率精度\n"
                "只有移位/加减（÷2），无乘除法，适合硬件实现")
 
-    def _steps(self, *args):
-        return midpoint_clip_steps(*args)
+    def _steps(self, x0, y0, x1, y1, window):
+        return midpoint_clip_steps(x0, y0, x1, y1, self._bbox(window))
 
     _clip_fn = staticmethod(midpoint_clip)
 
@@ -745,16 +846,17 @@ class LiangDemo(_LineClipDemo):
                "p = 0 且 q < 0 → 平行在外，舍弃\n"
                "u0 > u1 → 舍弃")
 
-    def _steps(self, *args):
-        return liang_barsky_steps(*args)
+    def _steps(self, x0, y0, x1, y1, window):
+        return liang_barsky_steps(x0, y0, x1, y1, self._bbox(window))
 
     _clip_fn = staticmethod(liang_barsky)
 
-    def _prelude_steps(self, a, b, rect, multi=False, full_px=None):
+    def _prelude_steps(self, a, b, window, multi=False, full_px=None):
         """判定铺垫：标出四条边界与初始参数区间，再逐边界判 p·t ≤ q。"""
         from algorithms.line_bresenham import bresenham_line
         from algorithms.steps import Step, label_guide, rect_guide
-        rx0, ry0, rx1, ry1 = rect
+        rx0, ry0, rx1, ry1 = self._bbox(window)
+        rect = (rx0, ry0, rx1, ry1)
         seg_px = sorted(full_px) if full_px else sorted(
             set(bresenham_line(a[0], a[1], b[0], b[1])))
         mx, my = (rx0 + rx1) // 2, (ry0 + ry1) // 2
@@ -777,104 +879,263 @@ class LiangDemo(_LineClipDemo):
 
 
 # =====================================================================
-# 多边形裁剪
+# 多边形裁剪：逐边裁剪（S-H，凸窗口） + 双边裁剪（W-A，任意窗口）
 # =====================================================================
-class PolygonClipDemo(_ClipDemoBase):
-    title = "多边形裁剪（Sutherland-Hodgman）"
-    icon = "polygon"
-    algo = ALGO_HODGMAN
+class _PolyClipDemo(_LineClipDemo):
+    """多边形裁剪演示页基类。
+
+    ★ 与线段裁剪页共用同一套【沿图形真实边界逐段判定】的框架：
+      每判定完一段，落在窗口内的像素立刻被挖掉（画面上一步步裁掉），
+      末帧 = 画布真实裁剪结果（"演完即所得"，播完那一瞬不跳变）。
+      差别只在"这一段怎么判"：
+        · S-H（逐边裁剪）：把这一段依次用窗口的每条半平面切一遍，
+          切完还剩下的那段就在窗口内 → 挖除。窗口必须**凸**。
+        · W-A（双边裁剪）：这一段与窗口边界求交，按【进入 / 离开】
+          分出窗口内的片段 → 挖除。窗口可以是任意简单多边形（凹的也行）。
+
+    ★ 窗口可以是【矩形】也可以是【画出来的多边形区域】：
+      切到"多边形窗口"后，在演示画布上逐点单击布点（点回起点 / 右键 /
+      Enter 闭合），窗口即参与判定；参数卡的四个数字只对矩形窗口有效。
+    """
+
     subject_kind = "closed"       # 演示对象 = 画布上选中/最后画的封闭图形
     # 判定过程要逐帧盯着看：每一步都在算求交 / 二分 / 参数收窄，
     # 2 步/秒仍嫌快（用户反馈："在最低速度下感觉都比较快"）→ 默认 1 步/秒；
     # 速度滑杆还能继续调慢到 0.1 步/秒（一步 10 秒）
     default_fps = 1
-    variables = {"阶段": "当前边", "轮次": "第几轮", "边界": "本轮用的边",
-                 "输入顶点": "输入", "输出顶点": "输出",
-                 "新增交点": "新交点", "情形": "S→E 情形",
-                 "内→内": "内→内", "内→外": "内→外",
-                 "外→内": "外→内", "外→外": "外→外"}
-    formula = ("Sutherland-Hodgman 逐边裁剪\n"
-               "左 → 右 → 上 → 下，逐条半平面切分\n"
-               "对每条边遍历 S→E：\n"
-               "  E 内 S 内 → 留 E\n"
-               "  E 内 S 外 → 交点 + E\n"
-               "  E 外 S 内 → 交点\n"
-               "  E 外 S 外 → 无\n"
-               "四轮后即窗口内多边形")
+    window_kind = "rect"          # "rect" 矩形窗口 / "poly" 画出来的多边形
+    _win_seg = None
 
     def _defs(self):
         return [("wx0", "窗口左", 16, -20, 120), ("wy0", "窗口上", 12, -20, 80),
                 ("wx1", "窗口右", 46, -20, 120), ("wy1", "窗口下", 34, -20, 80)]
 
-    def _vertices(self):
-        """演示多边形 = 画布图元的轮廓顶点；圆/椭圆先离散成折线。
+    # ---- 窗口形状切换（矩形 / 画出来的多边形） ----
+    def build_params(self, lay: QVBoxLayout):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        lab = QLabel("裁剪窗口")
+        lab.setObjectName("secondary")
+        self._win_seg = SegmentedControl(
+            ["矩形窗口", "多边形窗口"],
+            current=0 if self.window_kind == "rect" else 1)
+        self._win_seg.changed.connect(self._on_window_kind)
+        tip = QLabel("多边形窗口：在演示画布上逐点单击布点，右键/Enter 闭合")
+        tip.setObjectName("optHint")
+        row.addWidget(lab)
+        row.addWidget(self._win_seg)
+        row.addWidget(tip)
+        row.addStretch()
+        lay.addLayout(row)
+        super().build_params(lay)
 
-        没有对象（或只剩一条直线，凑不出面）时不生成任何示例。
+    def _on_window_kind(self, idx: int):
+        """切窗口形状：把画布上的裁剪工具切到对应模式。
 
-        圆/椭圆按极角排出的栅格轮廓有上百个点，逐个 S→E 判定要跑
-        4 轮 × 上百步（几分钟才播完，过程根本看不清）。超过 12 个点时
-        等间隔抽稀成 12 边形——仍贴着原轮廓，S-H 的"逐边遍历"才看得清。
+        切换会清掉已画好的窗口（两种形状的窗口不能混用），
+        之后重新在画布上拖矩形 / 布多边形点即可。
         """
-        src = self.playback_source()
-        if src is None:
+        self.window_kind = "rect" if idx == 0 else "poly"
+        tool = getattr(self, "_tool", None)
+        if tool is not None:
+            from modules.module04_clipping.tools import MODE_POLY, MODE_RECT
+            tool.mode = MODE_RECT if self.window_kind == "rect" else MODE_POLY
+            tool._reset_window()
+            tool._refresh_ui()
+        self._dirty = True
+
+    def tool_selector(self, canvas):
+        """切到裁剪工具，并把工具的窗口形状对齐到本页当前选择。"""
+        super().tool_selector(canvas)
+        tool = getattr(self, "_tool", None)
+        if tool is not None:
+            from modules.module04_clipping.tools import MODE_POLY, MODE_RECT
+            tool.mode = MODE_RECT if self.window_kind == "rect" else MODE_POLY
+            tool._refresh_ui()
+
+    def window_vertices(self, params=None):
+        """多边形窗口模式：窗口就是画布上画出来的那块区域。"""
+        if self.window_kind == "poly":
+            tool = getattr(self, "_tool", None)
+            poly = getattr(tool, "poly", None) if tool is not None else None
+            if poly and len(poly) >= 3:
+                return [(int(x), int(y)) for x, y in poly]
+            return []
+        return super().window_vertices(params)
+
+    def window_guide(self, window=None):
+        """多边形窗口画红色虚线轮廓（格角）；矩形窗口画红框。
+
+        与画布上裁剪工具画的窗口框同一口径（红色、格角）——两者完全
+        重合。早先这里画青色格心多边形，结果是"两重错开半格的窗口框"。
+        """
+        v = self.window_vertices() if window is None else window
+        if len(v) < 3:
             return None
-        verts = _outline_points(src)
-        if len(verts) > 12:
-            step = max(1, len(verts) // 12)
-            verts = verts[::step][:12]
-        return verts if len(verts) >= 3 else None
+        if self.window_kind == "poly":
+            from algorithms.steps import polygon_guide
+            return polygon_guide(v, color="#E5484D", dash=True, width=1.8,
+                                 anchor="corner")
+        return super().window_guide(v)
+
+    def _on_canvas_window(self, window):
+        """画布上确定的窗口。
+
+        多边形窗口模式下窗口直接从画布取，不需要回填参数卡；
+        矩形窗口模式仍然把包围盒回填到四个数字里。
+        """
+        if self.window_kind == "poly":
+            self._dirty = True
+            return
+        super()._on_canvas_window(window)
+
+    @property
+    def empty_hint(self):
+        """没有可演示内容时的提示（显示在进度条位置）。"""
+        if self.window_kind == "poly" and len(self.window_vertices()) < 3:
+            return ("多边形窗口还没画：在演示画布上逐点单击布点，"
+                    "点回起点 / 右键 / Enter 闭合")
+        if not self._window_ok():
+            return ("当前窗口形状不适用于本页算法，换一个窗口试试"
+                    "（或切到另一页算法）")
+        return super().empty_hint
+
+    def _window_ok(self) -> bool:
+        """当前窗口能否用于本页算法（S-H 只支持凸窗口）。"""
+        return True
 
     def make_steps(self, params):
-        self._pinned_source = self.playback_source()
-        verts = self._vertices()
-        if verts is None:
+        """窗口不适配本页算法时不出步骤（提示交给 empty_hint）。"""
+        if not self._window_ok():
             return []
-        rect = (min(params["wx0"], params["wx1"]),
-                min(params["wy0"], params["wy1"]),
-                max(params["wx0"], params["wx1"]),
-                max(params["wy0"], params["wy1"]))
-        steps = clip_polygon_steps(verts, rect)
-        # 「区域裁剪」= 裁去窗口内、保留窗口外。固定颜色语义（方案 A）：
-        #   蓝 = 窗口外保留部分（每帧常显，不参与动画）；
-        #   橙 = 窗口内待挖除部分（reference_pixels 橙色参照层）；
-        #   青色虚线框 = 算法当前结果多边形（guides，逐顶点生长）；
-        #   紫线 = 当前处理的 S→E 那条边。
-        # 旧写法把中间结果 pixels 与"原图像素"求交，沿窗口边界新生成的
-        # 边、收缩后的多边形全部被过滤掉——40 多帧画面几乎一动不动。
-        # 现在中间多边形走 guides，不再受原图像素约束。
-        if steps:
-            from algorithms.steps import Step, rect_guide
-            outside = set(self.kept_pixels(rect))
-            fill_list = sorted(self.kept_fill_pixels(rect))
-            for st in steps[:-1]:
-                st.pixels = sorted(outside)
-                st.tint = fill_list
-            first = steps[0]
-            first.note = (first.note
-                          + "（蓝=保留 · 橙=待挖除 · 虚线框=当前结果多边形）")
-            last = steps[-1]
-            steps[-1] = Step(
-                sorted(outside), dict(last.values),
-                "算法输出 = 窗口内这个多边形；区域裁剪把它挖除 → "
-                "只保留窗口外（橙色待挖除部分消失）",
-                guides=[rect_guide(rect)], tint=fill_list)
-        return steps
+        return super().make_steps(params)
 
-    def reference_pixels(self):
-        """窗口内的图元像素（橙色参照层 = 将被裁掉的部分）。
+    # ---- 铺垫：先把窗口和主体讲清楚 ----
+    def _prelude_steps(self, a, b, window, multi=False, full_px=None):
+        """铺垫一帧：窗口轮廓 + 主体轮廓 + 一句算法定位。
 
-        与线段页同一口径：rasterize 全部像素 − kept_pixels(窗口外)，
-        保证橙色严格落在窗口内，不会把窗口外的保留部分染成"将被删除"。
+        只讲一次，后面每段判定都在这个基础上叠加注记。
         """
-        src = self.playback_source()
-        if src is None:
-            return []
-        p = self.collect()
-        rect = (min(p["wx0"], p["wx1"]), min(p["wy0"], p["wy1"]),
-                max(p["wx0"], p["wx1"]), max(p["wy0"], p["wy1"]))
-        return sorted(self.cut_pixels(rect, src))
+        from algorithms.steps import (GUIDE_REF, Step, line_guide)
+        guides = []
+        guide = self.window_guide(window)
+        if guide is not None:
+            guides.append(guide)
+        guides.append(line_guide(a, b, GUIDE_REF, dash=True, width=1.6))
+        return [Step(sorted(full_px or []),
+                     {"阶段": "初始", "判定": "准备"},
+                     self._prelude_note(window),
+                     guides=guides)]
+
+    def _prelude_note(self, window) -> str:
+        return "准备：沿图形的边界一段段判定，落在窗口内的部分逐段挖除"
+
+
+class PolygonClipDemo(_PolyClipDemo):
+    """多边形裁剪 · 逐边裁剪（Sutherland-Hodgman）。
+
+    窗口必须是**凸**的：逐边裁剪把窗口表示成"若干半平面的交"，
+    凹窗口用半平面切会切出窗口外的部分——那种窗口请用 W-A 页。
+    """
+
+    title = "多边形裁剪（逐边裁剪 · S-H）"
+    icon = "polygon"
+    algo = ALGO_HODGMAN
+    variables = {"阶段": "当前阶段", "半平面": "本轮用的边",
+                 "情形": "两端判定", "本段长度": "本段结果",
+                 "判定": "判定", "段": "第几段"}
+    formula = ("Sutherland-Hodgman 逐边裁剪\n"
+               "窗口 = 若干半平面的交（所以窗口必须凸）\n"
+               "沿图形的每一条边，逐条窗口边切一遍：\n"
+               "  两端都在半平面内 → 整段保留\n"
+               "  一端在外         → 在交点处截断（交点 = 新的端点）\n"
+               "  两端都在外       → 整段出局（后面几条边不必再看）\n"
+               "切完还剩下的那段 = 落在窗口内 = 本模块要挖除的部分\n"
+               "经典写法按窗口边逐轮遍历顶点表，与逐边切等价：\n"
+               "  输出多边形的每条边 = 输入边被各半平面切剩的那一段")
+
+    def _window_ok(self) -> bool:
+        v = self.window_vertices()
+        if len(v) < 3:
+            return True
+        return is_convex([(float(x), float(y)) for x, y in v])
+
+    def _steps(self, x0, y0, x1, y1, window):
+        """这一段逐半平面切分（凸窗口）。"""
+        return clip_segment_convex_steps((float(x0), float(y0)),
+                                         (float(x1), float(y1)),
+                                         [(float(px), float(py))
+                                          for px, py in window])
+
+
+class PolygonClipWADemo(_PolyClipDemo):
+    """多边形裁剪 · 双边裁剪（Weiler-Atherton）。
+
+    窗口可以是**任意简单多边形**（凸或凹都成立）：一次求出被裁多边形
+    与窗口的全部交点，按【进入 / 离开】成对配对，交替沿"被裁多边形的边"
+    与"窗口的边"前进，一次得到交集。
+    """
+
+    title = "多边形裁剪（双边裁剪 · W-A）"
+    icon = "polygon"
+    algo = ALGO_WEILER
+    variables = {"阶段": "当前阶段", "进入点": "进入点数",
+                 "离开点": "离开点数", "本段": "本段结果",
+                 "判定": "判定", "段": "第几段"}
+    formula = ("Weiler-Atherton 双边裁剪\n"
+               "1. 求交：被裁多边形的每条边与窗口的每条边求交点\n"
+               "2. 定向：由外进入窗口内 = 【进入】点，反之 = 【离开】点\n"
+               "   进入与离开成对出现 —— 这就是\"双边\"的由来\n"
+               "3. 输出边界 = 被裁多边形落在窗口内的边（沿被裁方向）\n"
+               "          + 窗口落在被裁多边形内的边（沿窗口方向）\n"
+               "4. 两类边首尾相接即得交集多边形\n"
+               "窗口可以是任意简单多边形（凹窗口也对）\n"
+               "—— 逐边裁剪（S-H）做不到这一点")
+
+    def _steps(self, x0, y0, x1, y1, window):
+        """这一段与窗口求交，按进入/离开分出窗口内的片段。"""
+        return clip_segment_steps((float(x0), float(y0)),
+                                  (float(x1), float(y1)),
+                                  [(float(px), float(py))
+                                   for px, py in window])
+
+    def make_steps(self, params):
+        """在逐段判定之后，补一段"窗口的边落在主体内"的说明。
+
+        交集边界由两类边交替组成：被裁多边形的边（落在窗口内的部分）
+        + 窗口的边（落在被裁多边形内的部分）。前者是前面逐段判定走过的，
+        后者就是"双边"的另一半——不画出来，这一页就只剩半个算法。
+        """
+        steps = super().make_steps(params)
+        if not steps:
+            return steps
+        window = self.window_vertices(params)
+        src = self._pinned_source
+        if src is None or len(window) < 3:
+            return steps
+        from algorithms.steps import (GUIDE_MARK, Step, line_guide,
+                                      polygon_guide)
+        subject = _outline_points(src)
+        if len(subject) < 3:
+            return steps
+        caps = clip_window_segments([(float(x), float(y)) for x, y in subject],
+                                    [(float(x), float(y)) for x, y in window])
+        if not caps:
+            return steps
+        guides = [self.window_guide(window)]
+        for a, b in caps:
+            guides.append(line_guide(a, b, GUIDE_MARK, dash=False, width=3.0))
+        last = steps[-1]
+        steps.append(Step(
+            list(last.pixels), dict(last.values),
+            f"双边的另一半：窗口的边落在主体内的 {len(caps)} 段"
+            "（交集边界由被裁多边形的边 + 窗口的边交替组成）",
+            guides=guides, tint=list(last.tint)))
+        return steps
 
 
 # =====================================================================
 def create_demos():
-    return [CohenDemo(), MidpointDemo(), LiangDemo(), PolygonClipDemo()]
+    return [CohenDemo(), MidpointDemo(), LiangDemo(),
+            PolygonClipDemo(), PolygonClipWADemo()]

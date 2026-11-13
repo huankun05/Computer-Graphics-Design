@@ -75,7 +75,8 @@ def _mask_float(vertices):
             for x in range(x0, x1 + 1)
             if point_in_polygon(vertices, (x, y))}
 from modules.module04_clipping.demos import (CohenDemo, LiangDemo,  # noqa: E402
-                                            MidpointDemo, PolygonClipDemo)
+                                            MidpointDemo, PolygonClipDemo,
+                                            PolygonClipWADemo)
 from modules.module04_clipping.tools import ClipTool  # noqa: E402
 from ui import theme  # noqa: E402
 
@@ -121,6 +122,7 @@ PAGES = [
     ("中点分割", MidpointDemo, True),
     ("参数裁剪", LiangDemo, True),
     ("多边形裁剪", PolygonClipDemo, False),
+    ("多边形裁剪·双边", PolygonClipWADemo, False),
 ]
 
 PURPLE = "#7C3AED"          # GUIDE_MOVE：算法当前工作线段
@@ -497,6 +499,170 @@ def check_transform_after_clip():
         cv.close()
 
 
+def check_exact_intersection():
+    """C11：几何出口必须是【精确交点】，不能在出口处取整。
+
+    病灶（实测）：几何出口写的是 int(round(x))，斜边与斜边相交时
+    交点是小数，被取整后整体挪动最多半格——"三角形 × 三角形窗口"
+    的交集面积因此少算 5.8 px²（2.4%），斜边上的交点看上去像算错一半。
+    而且与应用侧的浮点几何掩膜对不上（两套口径）。
+
+    守卫自带精确解（分数形式，不依赖实现里的任何函数）：
+      主体边 A(10,10)→B(45,12) 与窗口边 F(30,30)→D(15,8) 相交于
+        x = 615/37 ≈ 16.6216, y = 384/37 ≈ 10.3784
+      旧代码取整后得到 (17, 10)，偏差 0.535 px —— 必须判红。
+    """
+    from algorithms.sutherland_hodgman import clip_polygon_convex
+    from algorithms.weiler_atherton import clip_polygon as wa_clip_polygon
+
+    subject = [(10.0, 10.0), (45.0, 12.0), (25.0, 38.0)]
+    window = [(15.0, 8.0), (45.0, 8.0), (30.0, 30.0)]
+    exact = (615.0 / 37.0, 384.0 / 37.0)
+
+    for algo_name, fn in (("S-H 逐边裁剪", clip_polygon_convex),
+                          ("W-A 双边裁剪", wa_clip_polygon)):
+        out = fn(subject, window)
+        best = min((((p[0] - exact[0]) ** 2 + (p[1] - exact[1]) ** 2) ** 0.5
+                    for p in out), default=1e9)
+        ok(best <= 0.02,
+           f"{algo_name}: 输出顶点离精确交点 {exact[0]:.4f},{exact[1]:.4f} "
+           f"偏差 {best:.4f} px > 0.02（几何出口被取整了，交点整体偏半格）")
+        ok(any(abs(p[0] - exact[0]) > 1e-9 or abs(p[1] - exact[1]) > 1e-9
+               for p in out),
+           f"{algo_name}: 输出顶点全是整数（几何出口应是浮点精确交点）")
+
+
+def check_polygon_window():
+    """C12：多边形窗口（画一个多边形区域去裁剪）必须与真实裁剪同口径。
+
+    用户要求："多边形裁剪不应该是画一个多边形区域去裁剪吗"。
+    这里用一个【凹的】多边形窗口跑两个多边形裁剪页，逐项核对：
+      · 参照层 == 真实擦除集（掩膜口径，与应用模式同一套 polygon_mask）；
+      · 动画末帧 == 真实保留集；
+      · 动画末帧 == 真跑一次 apply_crop 之后的画布像素；
+      · 像素层单调递减（挖除是渐进的，不是末帧一次性跳变）。
+    """
+    from modules.module04_clipping.demos import (PolygonClipDemo,
+                                                 PolygonClipWADemo)
+    # 凸窗口给逐边裁剪（S-H 只支持凸）；凹窗口给双边裁剪（W-A 的优势）
+    convex = [(12, 6), (46, 6), (46, 30), (30, 38), (12, 20)]
+    concave = [(12, 6), (46, 6), (46, 30), (30, 38), (30, 18), (12, 18)]
+    for page_name, demo_cls, window in (("逐边裁剪", PolygonClipDemo, convex),
+                                        ("双边裁剪", PolygonClipWADemo, concave)):
+        shape = PolygonShape(kind=KIND_POLYGON, fill=True, vertices=POLY_V,
+                             color=QColor("#222222"))
+        cv = CanvasView()
+        cv.document.shapes.append(shape)
+        cv._render_base()
+        demo = demo_cls()
+        demo._canvas = cv
+        demo.tool_selector(cv)
+        # 切到"多边形窗口"并把窗口摆上去（等价于用户在画布上布点闭合）
+        demo.window_kind = "poly"
+        tool = demo._tool
+        tool.mode = "poly"
+        tool.poly = list(window)
+        tool._mask_key = None
+        steps = demo.make_steps(demo.collect())
+        tag = f"多边形窗口/{page_name}"
+        ok(bool(steps), f"{tag}: 未生成步骤流")
+        if not steps:
+            cv.close()
+            continue
+
+        # 真实口径：与 ClipTool.apply_crop 同一套掩膜
+        mask = _mask_float(window)
+        outline, fill = rasterize(shape)
+        allpx = {(int(x), int(y)) for x, y in outline + fill}
+        real_cut = {p for p in allpx if p in mask}
+        real_kept = allpx - real_cut
+
+        ref = _px(demo.reference_pixels())
+        ok(ref == real_cut,
+           f"{tag}: 橙色参照层 != 真实擦除集"
+           f"（多标 {len(ref - real_cut)} / 漏标 {len(real_cut - ref)}）")
+
+        last = steps[-1]
+        frame = _px(last.pixels) | _px(last.tint)
+        ok(frame == real_kept,
+           f"{tag}: 动画末帧 != 真实保留集"
+           f"（多出 {len(frame - real_kept)} / 缺少 {len(real_kept - frame)}）")
+
+        tool2 = ClipTool(cv)
+        cv.set_tool(tool2)
+        tool2.apply_crop([shape], list(window), keep_window=True)
+        o2, f2 = rasterize(shape)
+        after = {(int(x), int(y)) for x, y in o2 + f2}
+        ok(frame == after,
+           f"{tag}: 动画末帧 != 真实裁剪结果"
+           f"（多出 {len(frame - after)} / 缺少 {len(after - frame)}）")
+
+        sizes = [len(st.pixels) for st in steps]
+        ok(all(sizes[i] >= sizes[i + 1] for i in range(len(sizes) - 1)),
+           f"{tag}: 像素层不是单调递减（挖除过程不是渐进的）")
+        cv.close()
+
+    # 逐边裁剪遇到【凹】窗口必须拒绝出步骤，而不是给一个错的结果
+    # （半平面的交表示不了凹窗口；这类窗口请用双边裁剪页）
+    shape = PolygonShape(kind=KIND_POLYGON, fill=True, vertices=POLY_V,
+                         color=QColor("#222222"))
+    cv = CanvasView()
+    cv.document.shapes.append(shape)
+    cv._render_base()
+    demo = PolygonClipDemo()
+    demo._canvas = cv
+    demo.tool_selector(cv)
+    demo.window_kind = "poly"
+    tool = demo._tool
+    tool.mode = "poly"
+    tool.poly = list(concave)
+    tool._mask_key = None
+    steps = demo.make_steps(demo.collect())
+    ok(not steps,
+       "多边形窗口/逐边裁剪: 凹窗口竟然生成了步骤流"
+       "（半平面切不出凹窗口，结果是错的，必须拒绝）")
+    ok(bool(demo.empty_hint),
+       "多边形窗口/逐边裁剪: 凹窗口被拒绝时没有给出提示")
+    cv.close()
+
+
+def check_app_polygon_window():
+    """C13：应用模式（不是演示）用多边形窗口挖除，必须与掩膜一致。
+
+    用户要求："多边形裁剪不应该是画一个多边形区域去裁剪吗"——应用模式
+    里画一个多边形区域，按"挖除窗口内"必须真的只挖掉窗口内那部分，
+    且挖除区要记成【几何多边形】随图元一起变换（旋转后仍是干净一块）。
+    """
+    from modules.module04_clipping.tools import MODE_POLY
+    window = [(12, 6), (46, 6), (46, 30), (30, 38), (30, 18), (12, 18)]
+    shape = PolygonShape(kind=KIND_POLYGON, fill=True, vertices=POLY_V,
+                         color=QColor("#222222"))
+    cv = CanvasView()
+    cv.document.shapes.append(shape)
+    cv._render_base()
+    tool = ClipTool(cv)
+    cv.set_tool(tool)
+    tool.mode = MODE_POLY
+    tool.poly = list(window)
+    tool._mask_key = None
+
+    mask = _mask_float(window)
+    outline, fill = rasterize(shape)
+    allpx = {(int(x), int(y)) for x, y in outline + fill}
+    want_cut = {p for p in allpx if p in mask}
+    tool._apply_all()
+    o2, f2 = rasterize(shape)
+    after = {(int(x), int(y)) for x, y in o2 + f2}
+    ok(after == allpx - want_cut,
+       f"应用模式/多边形窗口: 挖除结果不对"
+       f"（多留 {len(after - (allpx - want_cut))} / 多挖 "
+       f"{len((allpx - want_cut) - after)}）")
+    ok(bool(shape.cuts) and len(shape.cuts[0]) == len(window),
+       "应用模式/多边形窗口: 挖除区没有记成几何多边形"
+       "（旋转后会残留黑散点）")
+    cv.close()
+
+
 print("=" * 64)
 print("模块四裁剪演示：动画口径 vs 真实裁剪")
 for page_name, demo_cls, is_line_page in PAGES:
@@ -536,6 +702,18 @@ from teaching.player import MAX_FPS, MIN_FPS  # noqa: E402
 ok(MIN_FPS <= 0.1 + 1e-9,
    f"播放器最慢档 {MIN_FPS:g} 步/秒（应 ≤0.1，即一步 10 秒）")
 ok(MAX_FPS >= 240 - 1e-9, f"播放器最快档 {MAX_FPS:g} 步/秒（应 ≥240）")
+
+print("-" * 64)
+print("几何出口：斜边交点不能被取整（几何精确性）")
+check_exact_intersection()
+
+print("-" * 64)
+print("多边形窗口：画一个多边形区域去裁剪")
+check_polygon_window()
+
+print("-" * 64)
+print("应用模式：多边形窗口挖除")
+check_app_polygon_window()
 
 print("=" * 64)
 if FAIL:

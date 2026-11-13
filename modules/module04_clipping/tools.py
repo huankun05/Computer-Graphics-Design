@@ -495,10 +495,18 @@ class ClipTool(ToolBase):
         self._cursor = None
 
     def _notify_window(self):
-        """窗口最终确定后通知宿主（演示页回填参数用）。"""
+        """窗口最终确定后通知宿主（演示页回填参数用）。
+
+        通知的是窗口的**顶点列表**（矩形 = 4 个角点，多边形 = 画出来的
+        顶点）。演示页统一按"多边形窗口"处理这一份数据，矩形/多边形
+        两种形状走同一套判定与掩膜。
+        """
         cb = self.window_changed
-        if callable(cb) and self.rect is not None:
-            cb(tuple(self.rect))
+        if not callable(cb):
+            return
+        vs = self.window_vertices()
+        if vs:
+            cb([tuple(p) for p in vs])
 
     # ---- 命中判定 ----
     @staticmethod
@@ -568,7 +576,12 @@ class ClipTool(ToolBase):
             painter.drawRect(int(x * SIM) - 3, int(y * SIM) - 3, 6, 6)
 
     def _draw_poly_overlay(self, painter, SIM):
-        """多边形窗口：闭合显示；布点中显示折线 + 到鼠标的橡皮筋。"""
+        """多边形窗口：闭合显示；布点中显示折线 + 到鼠标的橡皮筋。
+
+        顶点画在【格角】：窗口掩膜按顶点判定像素（point_in_polygon 把
+        (x, y) 当作像素格角），顶点连线才是掩膜的真实边界；画在格心
+        会整体偏半格，与演示步骤里的窗口注记也对不上。
+        """
         pts = self._verts if self._verts else (self.poly or [])
         if not pts:
             return
@@ -680,22 +693,39 @@ class ClipTool(ToolBase):
     # ------------------------------------------------------------------
     # 裁剪执行（演示页播完）：裁去窗口【内】，保留窗口外
     # ------------------------------------------------------------------
-    def apply_crop(self, subjects, rect, keep_window: bool = False):
+    @staticmethod
+    def _window_corners(window):
+        """窗口参数 → 顶点列表（兼容矩形四元组与多边形顶点表）。
+
+        矩形传 (x0, y0, x1, y1)；多边形传 [(x, y), ...]。两者最后都
+        变成"多边形顶点"这一种形态，掩膜、挖除、几何挖除区共用一套口径。
+        """
+        if window is None:
+            return []
+        if isinstance(window, tuple) and len(window) == 4 and \
+                all(isinstance(v, int) for v in window):
+            x0, y0, x1, y1 = window
+            return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        return [(int(x), int(y)) for x, y in window]
+
+    def apply_crop(self, subjects, window, keep_window: bool = False):
         """区域裁剪：裁掉窗口【内】的像素，窗口外原样保留。
 
         与 _apply_all（窗口内消失的区域挖除）方向一致——本模块的"裁剪"
         就是挖掉窗口覆盖的那片区域；演示页的四页动画末帧也按同一口径，
         播完必须落到同一个结果上，否则动画和画布对不上。
+        window 可以是矩形四元组，也可以是多边形顶点表（凹的也行）。
         只作用于本次演示对象，画布上其它图元不受影响。
         返回 [(shape, before, after), ...] 供重播前还原。
         """
         if not subjects:
             self._set_msg("画布上没有可裁剪的图元")
             return []
-        x0, y0, x1, y1 = rect
-
-        def inside(p):
-            return x0 <= p[0] <= x1 and y0 <= p[1] <= y1
+        verts = self._window_corners(window)
+        if len(verts) < 3:
+            self._set_msg("裁剪窗口无效（至少需要 3 个顶点）")
+            return []
+        mask = polygon_mask(verts)
 
         doc = self.canvas.document
         entries = []                     # [(shape, before, after)]
@@ -704,13 +734,14 @@ class ClipTool(ToolBase):
             if not s.visible:
                 continue
             outline, fill = rasterize(s)
-            out = {p for p in set(outline) | set(fill) if inside(p)}
+            out = {p for p in set(outline) | set(fill) if p in mask}
             if not out or out <= s.erased:
                 continue
             before = snapshot(s)
             s.erased |= out
-            # 几何挖除区域（窗口矩形）：随图元一起变换，旋转后仍是干净一块
-            s.cuts.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            # 几何挖除区域（窗口多边形）：随图元一起变换，旋转后仍是
+            # 干净一块，不会像像素采样那样漏格
+            s.cuts.append(list(verts))
             entries.append((s, before, snapshot(s)))
             total += len(out)
         # 依附于被裁图元的油漆桶填充：一起按窗口裁剪
@@ -720,12 +751,12 @@ class ClipTool(ToolBase):
                 continue
             if id(f.owner) not in ids:
                 continue
-            out = {p for p in f.pixels if inside(p)}
+            out = {p for p in f.pixels if p in mask}
             if not out or out <= f.erased:
                 continue
             before = snapshot(f)
             f.erased |= out
-            f.cuts.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            f.cuts.append(list(verts))
             entries.append((f, before, snapshot(f)))
             total += len(out)
 
