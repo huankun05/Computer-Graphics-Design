@@ -778,6 +778,60 @@ _hex.mouseMoveEvent(_me(_QEvent.MouseMove, 220, 260))
 _hex.mouseReleaseEvent(_me(_QEvent.MouseButtonRelease, 220, 260))
 app.processEvents()
 expect(abs(_hex.yaw - _yaw0) < 0.2, "反方向拖回：视角还原（可逆）")
+
+# 7.3b 演示模式右栏窄宽回归：任何演示页都不得把 336px 右栏撑出横向滚动条
+# 病根：QLabel 默认不换行 → 它的最小宽度 = 整句文字宽度（实测 312~592px），
+# 而右栏只有 336px → 内容体最小宽度超出视口 → QScrollArea 长出横向滚动条
+# → 公式卡/监视器/播放控制等所有卡片的内容被压窄截断（用户反馈
+# "右侧的 UI 怎么变了"）。
+# 用【独立 DemoView 实例】跑：遍历 18 个演示页会改掉像素层的全局沉淀状态
+# （实测：之后播放器的"前一步沉淀"用例会失败），不能借用主窗口那一份。
+from PySide6.QtWidgets import QScrollArea as _QSA
+from ui.demo_view import DemoView as _DemoView
+
+_probe_dv = _DemoView()
+_probe_dv.resize(1200, 900)
+_probe_dv.setAttribute(_Qt.WA_DontShowOnScreen, True)
+_probe_dv.show()
+app.processEvents()
+
+
+def _find_teach_scroll(dv):
+    cur = dv.card_params
+    while cur is not None:
+        cur = cur.parentWidget()
+        if isinstance(cur, _QSA):
+            return cur
+    return None
+
+
+_teach_scroll = _find_teach_scroll(_probe_dv)
+expect(_teach_scroll is not None, "演示模式右栏滚动区可定位")
+_overflow_pages = []
+_body_over = []
+if _teach_scroll is not None:
+    for _dp in _probe_dv._all_pages:
+        _probe_dv._load_page(_dp)
+        for _ in range(2):
+            app.processEvents()
+        _hs = _teach_scroll.horizontalScrollBar()
+        _vw = _teach_scroll.viewport().width()
+        _bw = _teach_scroll.widget().width()
+        if _hs.isVisible():
+            _overflow_pages.append(f"{_dp.title}(滚动)")
+        if _vw > 0 and _bw > _vw:
+            _body_over.append(f"{_dp.title}({_bw}>{_vw})")
+expect(not _overflow_pages,
+       f"演示模式右栏 {len(_probe_dv._all_pages)} 页均无横向滚动条"
+       + (f"；溢出：{_overflow_pages}" if _overflow_pages else ""))
+expect(not _body_over,
+       "演示模式右栏内容体宽度 ≤ 视口宽度（文字不被截断）"
+       + (f"；超宽：{_body_over}" if _body_over else ""))
+_probe_dv.deleteLater()
+_probe_dv.hide()
+del _probe_dv
+app.processEvents()
+
 win._on_mode_changed(0)
 app.processEvents()
 expect(win.body_stack.currentIndex() == 0, "切回应用模式")

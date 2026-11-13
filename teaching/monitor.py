@@ -162,8 +162,14 @@ class MonitorPanel(QFrame):
         """按变量说明字典重建行集（切换演示页时调用）。"""
         while self._grid.count():
             item = self._grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget()
+            if w is not None:
+                # 立即脱离父级再删：deleteLater 是延迟删除，旧行控件在
+                # 真正被删掉之前仍会画在原处，与新建的同行控件叠在一起
+                # （表现：切页后监视器里上一页的值和新的名称糊成一团）。
+                # setParent(None) 会同时隐藏它，视觉上立刻干净。
+                w.setParent(None)
+                w.deleteLater()
         self._labels.clear()
         for row, (key, cn) in enumerate(desc.items()):
             name = QLabel(cn if cn else key)

@@ -481,6 +481,13 @@ class DemoView(QWidget):
             # 否则没重新生成前还挂着上一页的算法轨迹与边界注记
             self.player.load([])
         self.current_demo = demo
+        # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢。
+        # 必须放在"无画板交互页"的提前返回【之前】：交互页（模块一颜色模型）
+        # 没有步骤流，若在这里 return，像素层的累积模式就会残留上一张画布页
+        # 的取值——从变换页（替换式）切到交互页再切回来时，画布页会重新设定
+        # 模式，但期间直接往像素层灌步骤就会得到"不累积"的错误表现
+        # （烟测用例 7.4「前一步沉淀为已完成像素」即栽在这里）。
+        self.canvas.demo.set_accumulate(getattr(demo, "trails", True))
         is_widget = getattr(demo, "kind", "canvas") == "widget"
         # 面板随页型切换：模块一等交互页没有参数卡/决策项监视/播放控制
         # （参数在画面内、无步骤流概念），换上"概念说明"卡
@@ -501,6 +508,13 @@ class DemoView(QWidget):
         self._clear_layout(self.params_lay)
         if not is_widget:
             demo.build_params(self.params_lay)
+            # 宽标签强制换行：QLabel 默认不换行时，它的最小宽度 = 整句
+            # 文字宽度（实测一条提示 382~592px），会把 336px 的右栏撑开
+            # → QScrollArea 长出横向滚动条 → 公式卡/监视器等所有卡片
+            # 的内容被压窄截断（用户反馈"右侧的 UI 怎么变了"）。
+            # 放在 build_params 之后统一处理，任何演示页将来写长提示
+            # 都不会再复发（不针对单个页面打补丁）。
+            self._fit_panel_labels()
             # 参数控件变化 → 防抖重生成。注意必须"调用" start()：
             # 此前 QComboBox 连接写成 lambda: self._regen_timer.start
             # （返回方法对象而不调用），下拉切换从不触发生成——
@@ -558,8 +572,6 @@ class DemoView(QWidget):
                                  if hasattr(demo, "subject_kind") else None)
 
         self._restore_replay_shapes()  # 切页前恢复上一轮回放的图元显示
-        # 每页渲染/节奏：变换页替换式（每帧只显示当前图形、无拖影）且放慢
-        self.canvas.demo.set_accumulate(getattr(demo, "trails", True))
         if hasattr(self, "speed_slider"):
             # 各页默认速度按页给（裁剪页慢放），统一走 ×10 的滑杆刻度
             self.speed_slider.setValue(
@@ -606,11 +618,17 @@ class DemoView(QWidget):
 
     @staticmethod
     def _clear_layout(lay):
-        """递归清空布局：销毁子控件与子布局（防切页残留重叠）。"""
+        """递归清空布局：销毁子控件与子布局（防切页残留重叠）。
+
+        控件要"先脱离父级再删"：deleteLater 是延迟删除，被 takeAt
+        移出布局的控件在此期间仍画在原处，会与新建的控件叠在一起
+        （切页瞬间右栏出现两层文字）。setParent(None) 会立刻隐藏它。
+        """
         while lay.count():
             item = lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.setParent(None)
                 w.deleteLater()
             sub = item.layout()
             if sub is not None:
@@ -834,6 +852,44 @@ class DemoView(QWidget):
 
         walk(self.params_lay)
         return out
+
+    # 右栏面板固定 336px，减去左右边距(12+12)与滚动条余量后的可用文本宽
+    _PANEL_TEXT_LIMIT = 280
+
+    def _fit_panel_labels(self):
+        """参数卡里的宽标签一律允许换行，防止撑破 336px 的右栏。
+
+        QLabel 默认不换行 → 它的【最小宽度 = 整句文字宽度】
+        （实测一条提示 382px；旧版把提示塞进分段控件同一行时更到 592px），
+        而右栏只有 336px：内容体最小宽度超过视口 → QScrollArea 长出
+        横向滚动条 → 公式卡/监视器/播放控制等所有卡片的内容被压窄截断
+        （用户反馈"右侧的 UI 怎么变了"）。
+
+        只动"宽度超限"的标签：短标签保持原样，零视觉影响；
+        换行后 QLabel 的最小宽度降到 30px（实测），任何页面将来写长提示
+        都不会再复发 —— 这是一条通用防线，不针对单个页面打补丁。
+
+        注意取控件要用【卡片控件】而不是 params_lay：params_lay 是
+        QVBoxLayout，QLayout.findChildren 走 QObject 树，而控件的 QObject
+        父级是卡片内容体 body（QWidget），在 layout 上查永远是空。
+        """
+        for lab in self.card_params.findChildren(QLabel):
+            if lab.wordWrap():
+                continue
+            try:
+                w = max(lab.sizeHint().width(),
+                        lab.minimumSizeHint().width())
+                # 兜底：控件刚建好、还没走完布局时 sizeHint 可能偏小，
+                # 用字体度量再量一次文本实际宽度
+                txt = lab.text()
+                if txt:
+                    fm = lab.fontMetrics()
+                    w = max(w, max(fm.horizontalAdvance(ln)
+                                   for ln in txt.split("\n")))
+            except Exception:
+                continue
+            if w > self._PANEL_TEXT_LIMIT:
+                lab.setWordWrap(True)
 
     def _on_regen_timeout(self):
         """参数防抖到点：对比页零动画——只失效旧步骤（点播放才生成）；

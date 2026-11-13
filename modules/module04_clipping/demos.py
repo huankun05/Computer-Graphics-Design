@@ -921,14 +921,33 @@ class _PolyClipDemo(_LineClipDemo):
             ["矩形窗口", "多边形窗口"],
             current=0 if self.window_kind == "rect" else 1)
         self._win_seg.changed.connect(self._on_window_kind)
-        tip = QLabel("多边形窗口：在演示画布上逐点单击布点，右键/Enter 闭合")
-        tip.setObjectName("optHint")
+        self._win_seg.setToolTip(
+            "矩形窗口：参数卡填四个边，或在演示画布上拖出\n"
+            "多边形窗口：在演示画布上逐点单击布点，右键/Enter 闭合")
         row.addWidget(lab)
         row.addWidget(self._win_seg)
-        row.addWidget(tip)
         row.addStretch()
         lay.addLayout(row)
+        # 提示单独占一行且【必须换行】：QLabel 默认不换行，它的最小宽度
+        # 等于整句文字的宽度（实测 592px），会把 336px 的右栏整个撑开，
+        # 右栏出现横向滚动条、公式卡等所有卡片的内容被截断（用户反馈
+        # "右侧的 UI 怎么变了"）。
+        self._win_tip = QLabel("")
+        self._win_tip.setObjectName("optHint")
+        self._win_tip.setWordWrap(True)
+        lay.addWidget(self._win_tip)
+        self._update_win_tip()
         super().build_params(lay)
+
+    def _update_win_tip(self):
+        """提示文字随窗口形状变化。"""
+        tip = getattr(self, "_win_tip", None)
+        if tip is None:
+            return
+        tip.setText("多边形窗口：在演示画布上逐点单击布点，"
+                    "点回起点 / 右键 / Enter 闭合"
+                    if self.window_kind == "poly" else
+                    "矩形窗口：在演示画布拖出窗口，或直接填下面的四个数字")
 
     def _on_window_kind(self, idx: int):
         """切窗口形状：把画布上的裁剪工具切到对应模式。
@@ -937,6 +956,7 @@ class _PolyClipDemo(_LineClipDemo):
         之后重新在画布上拖矩形 / 布多边形点即可。
         """
         self.window_kind = "rect" if idx == 0 else "poly"
+        self._update_win_tip()
         tool = getattr(self, "_tool", None)
         if tool is not None:
             from modules.module04_clipping.tools import MODE_POLY, MODE_RECT
