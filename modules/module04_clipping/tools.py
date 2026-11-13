@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
 
 from algorithms.window_mask import point_in_polygon, polygon_mask
 from core.commands import ClipShapesCommand
-from core.rasterizer import rasterize
+from core.rasterizer import gone_pixels, rasterize
 from core.shapes import RasterFillShape, snapshot
 from core.tool_base import ToolBase
 from ui.widgets import SegmentedControl
@@ -654,9 +654,11 @@ class ClipTool(ToolBase):
             if not hit:
                 continue
             before = snapshot(s)
-            s.erased |= hit
-            # 几何挖除区域：窗口多边形随图元一起变换（旋转/缩放后仍是
-            # 干净的一块，不会像像素采样那样漏格 → 残留黑散点）
+            # ★ 区域裁剪只写【几何】口径（cuts），不再把挖掉的像素混进
+            #   erased（点采样）。两块区域用了两套不同源的口径时，变换
+            #   后会误挖掉本该保留的轮廓像素——图形边框凭空出现缺口，
+            #   看起来就是"边框没有跟着图形走"（用户反馈）。
+            #   详见 core/rasterizer.gone_pixels 的说明。
             s.cuts.append([(int(x), int(y)) for x, y in window])
             entries.append((s, before, snapshot(s)))
             total += len(hit)
@@ -671,7 +673,6 @@ class ClipTool(ToolBase):
             if not hit:
                 continue
             before = snapshot(f)
-            f.erased |= hit
             f.cuts.append([(int(x), int(y)) for x, y in window])
             entries.append((f, before, snapshot(f)))
             total += len(hit)
@@ -735,12 +736,13 @@ class ClipTool(ToolBase):
                 continue
             outline, fill = rasterize(s)
             out = {p for p in set(outline) | set(fill) if p in mask}
-            if not out or out <= s.erased:
+            # "已经挖掉"的像素 = 橡皮擦点采样 ∪ 之前的区域裁剪几何掩膜
+            if not out or out <= gone_pixels(s):
                 continue
             before = snapshot(s)
-            s.erased |= out
-            # 几何挖除区域（窗口多边形）：随图元一起变换，旋转后仍是
-            # 干净一块，不会像像素采样那样漏格
+            # 只写几何口径（cuts）：区域裁剪是"挖掉窗口这块区域"，
+            # 区域随图元一起变换，渲染时按几何重新求交（理由见
+            # core/rasterizer.gone_pixels）。
             s.cuts.append(list(verts))
             entries.append((s, before, snapshot(s)))
             total += len(out)
@@ -752,10 +754,9 @@ class ClipTool(ToolBase):
             if id(f.owner) not in ids:
                 continue
             out = {p for p in f.pixels if p in mask}
-            if not out or out <= f.erased:
+            if not out or out <= gone_pixels(f):
                 continue
             before = snapshot(f)
-            f.erased |= out
             f.cuts.append(list(verts))
             entries.append((f, before, snapshot(f)))
             total += len(out)

@@ -406,6 +406,240 @@ def clip_window_segments(points: Sequence[Point],
     return out
 
 
+# ---------------------------------------------------------------------
+# 双边交替路径：沿【图形边】↔【窗口边】交替前进
+# ---------------------------------------------------------------------
+def _closed(seq: Sequence[Point]) -> List[Point]:
+    """点列 → 闭合点列（末点补回首点）。
+
+    闭合是必须的：多边形的【收尾那一条边】（末顶点 → 首顶点）同样会与
+    对方边界求交，漏掉它就会少求出一半交点——交集边界缺了"窗口边"那一
+    半，双边交替就退化成只沿图形边走（实测：窗口左边界上的两个交点
+    整个丢失，W 段一条都没生成）。
+    """
+    pts = [(float(x), float(y)) for x, y in seq]
+    if len(pts) < 2:
+        return pts
+    if abs(pts[0][0] - pts[-1][0]) < 1e-9 and abs(pts[0][1] - pts[-1][1]) < 1e-9:
+        return pts
+    return pts + [pts[0]]
+
+
+def _poly_crossings(seq: Sequence[Point],
+                    other: Sequence[Point]) -> List[Tuple[int, float, Point]]:
+    """闭合点列 seq 与闭合多边形 other 的交点。
+
+    返回 [(段号, 段内参数, 交点)]，按 (段号, 参数) 升序 —— 也就是沿
+    seq 方向的先后次序。段内参数必须参与排序：同一段上可能有两个交点
+    （例如窗口的左边框同时穿过图形的上下两条边），只按段号排会得到
+    相反的先后次序，双边交替就会走反方向。
+    """
+    out: List[Tuple[int, float, Point]] = []
+    for i in range(len(seq) - 1):
+        a, b = seq[i], seq[i + 1]
+        for j in range(len(other) - 1):
+            c, d = other[j], other[j + 1]
+            hit = _seg_intersect(a, b, c, d)
+            if hit is None:
+                continue
+            t, pt = hit
+            if any(abs(pt[0] - q[2][0]) < 1e-7 and
+                   abs(pt[1] - q[2][1]) < 1e-7 for q in out):
+                continue                      # 顶点处会算两遍，去重
+            out.append((i, t, pt))
+    out.sort(key=lambda v: (v[0], v[1]))
+    return out
+
+
+def _path_mid(pts: Sequence[Point]) -> Point:
+    """折线路径的弧长中点（按顺序走过 pts 的各段）。"""
+    if not pts:
+        return (0.0, 0.0)
+    total = 0.0
+    for a, b in zip(pts, pts[1:]):
+        total += math.hypot(b[0] - a[0], b[1] - a[1])
+    if total <= 0:
+        return pts[0]
+    half = total / 2.0
+    acc = 0.0
+    for a, b in zip(pts, pts[1:]):
+        d = math.hypot(b[0] - a[0], b[1] - a[1])
+        if acc + d >= half:
+            t = (half - acc) / d if d > 0 else 0.0
+            return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        acc += d
+    return pts[-1]
+
+
+def _classify(seq: Sequence[Point], other: Sequence[Point],
+              crossings: Sequence[Tuple[int, float, Point]]) -> List[str]:
+    """给交点分类：【进入】= 沿 seq 前进后进入 other 内部，否则【离开】。
+
+    判据取"从该交点沿 seq 走到下一个交点"这条**路径**的中点是否在
+    other 内。必须按路径取中点，不能取两个交点的直线中点——闭合边界
+    上两个交点之间可能绕了大半圈（窗口边的"离开图形"那一段绕到窗口
+    另一侧），直线中点会落在路径之外，分类就反了。
+    """
+    kinds: List[str] = []
+    n = len(crossings)
+    for idx, (i, _t, pt) in enumerate(crossings):
+        ni, _nt, npt = crossings[(idx + 1) % n]
+        # 最后一个交点的"下一个"是绕回序列开头的那个 → 路径要绕大半圈
+        mid = _path_mid(_slice_path(seq, i, pt, ni, npt, wrap=(idx + 1 == n)))
+        kinds.append("进入" if _point_in(other[:-1], mid) else "离开")
+    return kinds
+
+
+def _slice_path(seq: Sequence[Point], i0: int, pt0: Point,
+                i1: int, pt1: Point, wrap: bool = False) -> List[Point]:
+    """闭合点列上从 (i0,pt0) 走到 (i1,pt1) 的点列（含两端）。
+
+    走法：pt0 → seq[i0+1] → … → seq[i1] → pt1（段号可绕回序列开头）。
+    点列保持原样，所以图形边的这段轨迹就是**原轮廓的像素**本身，
+    判定轨迹与原图逐像素重合（用户反馈："画出来的轨迹和原来的轨迹
+    不一样，像是两种画法"）。
+
+    wrap=True 表示"绕回序列开头"（走到的是同一段上的另一个交点，
+    但路径是绕了大半圈才到）——这时不能按同段短路处理。
+    """
+    n = len(seq) - 1
+    if i0 == i1 and not wrap:
+        # 两个交点在同一段上（且不是绕圈）：路径就是这一段里的一小截
+        # 直线，不能绕整圈（那会把窗口边界整个画一遍，轨迹全错）。
+        return [pt0, pt1]
+    pts: List[Point] = [pt0]
+    i = i0
+    for _ in range(n + 2):
+        i = (i + 1) % n
+        pts.append(seq[i])
+        if i == i1:
+            break
+    pts.append(pt1)
+    return pts
+
+
+def _next_node(nodes: Sequence[Tuple[int, Point, str]], k: int,
+               kind: str) -> Optional[int]:
+    """从第 k 个节点出发，沿序列方向找下一个 kind 节点的下标。
+
+    只有第 k 个节点自己属于 kind 时返回 None（没有"下一个"）——
+    否则会把 k 本身当成下一个，走成自环。
+    """
+    n = len(nodes)
+    for step in range(1, n):
+        idx = (k + step) % n
+        if nodes[idx][2] == kind:
+            return idx
+    return None
+
+
+def _find_node(nodes: Sequence[Tuple[int, Point, str]], pt: Point,
+               tol: float = 1e-6) -> Optional[int]:
+    """按坐标找节点（同一个几何交点在两条边界上是同一个点）。"""
+    for k, (_i, p, _kind) in enumerate(nodes):
+        if abs(p[0] - pt[0]) <= tol and abs(p[1] - pt[1]) <= tol:
+            return k
+    return None
+
+
+def wa_outline_path(edges_pts: Sequence[Sequence[Point]],
+                    window: Sequence[Point]) -> List[dict]:
+    """Weiler-Atherton 交集边界：沿【图形边】↔【窗口边】交替前进。
+
+    这才是"双边"的完整含义：交集边界由两类段**交替**组成——
+      · P 段：图形边落在窗口内的部分（沿图形方向）→ 这条边的像素要被挖除；
+      · W 段：窗口边落在图形内的部分（沿窗口方向）→ 交集边界的另一半。
+
+    edges_pts: 图形轮廓按"边"分组的有序点列（每组一条边的像素），
+               相邻点连线就是该边 ⇒ 判定轨迹与原轮廓逐像素重合。
+    window:    裁剪窗口多边形顶点（任意简单多边形）。
+
+    返回交替段序列，每项：
+      {"kind": "P"/"W", "pts": [...], "enter": pt, "leave": pt, "edge": i}
+    无交点（图形整体在窗口内或整体在外）时返回空列表。
+    """
+    if not edges_pts or len(window) < 3:
+        return []
+    W = _to_ccw(window)
+    # 图形侧：把各边的像素拼成一条闭合折线（首尾相接）
+    # 相邻两段首尾相接（上一段的末点 = 下一段的首点），拼接时每段
+    # 去掉【首点】保留【末点】——若去掉末点，最后一段的末点会整段丢失
+    # （圆的极左点正好落在那里，画面上会剩一个孤立的蓝点）。
+    S: List[Point] = []
+    edge_of: List[int] = []
+    for ei, pts in enumerate(edges_pts):
+        if len(pts) < 2:
+            continue
+        start = 0 if not S else 1
+        for q in pts[start:]:
+            S.append((float(q[0]), float(q[1])))
+            edge_of.append(ei)
+    if len(S) < 3:
+        return []
+    S = _closed(S)
+    Wc = _closed(W)
+
+    p_cross = _poly_crossings(S, Wc)
+    w_cross = _poly_crossings(Wc, S)
+    if not p_cross or not w_cross:
+        return []
+
+    p_kinds = _classify(S, Wc, p_cross)
+    w_kinds = _classify(Wc, S, w_cross)
+    p_nodes = [(i, pt, k) for (i, _t, pt), k in zip(p_cross, p_kinds)]
+    w_nodes = [(i, pt, k) for (i, _t, pt), k in zip(w_cross, w_kinds)]
+
+    out: List[dict] = []
+    used = set()
+    for start in range(len(p_nodes)):
+        if p_nodes[start][2] != "进入" or start in used:
+            continue
+        start_pt = p_nodes[start][1]
+        k = start
+        guard = 0
+        while guard < len(p_nodes) * 2 + 8:
+            guard += 1
+            used.add(k)
+            # ---- P 段：从进入点沿图形边走到下一个离开点 ----
+            k_leave = _next_node(p_nodes, k, "离开")
+            if k_leave is None:
+                break
+            i_leave, pt_leave, _ = p_nodes[k_leave]
+            i_enter, pt_enter, _ = p_nodes[k]
+            out.append({"kind": "P",
+                        "pts": _slice_path(S, i_enter, pt_enter,
+                                           i_leave, pt_leave,
+                                           wrap=(k_leave <= k)),
+                        "enter": pt_enter, "leave": pt_leave,
+                        "edge": edge_of[i_enter] if i_enter < len(edge_of)
+                        else 0})
+            # ---- W 段：从离开点沿窗口边走到下一个进入点 ----
+            # 图形在离开点"离开窗口" ⇒ 沿窗口方向此处"进入图形"
+            # （横截交叉时二者互补），所以窗口边上的下一段要走到
+            # "窗口离开图形"的那个交点——它正是下一个图形进入点。
+            kw = _find_node(w_nodes, pt_leave)
+            if kw is None:
+                break
+            kw_next = _next_node(w_nodes, kw, "离开")
+            if kw_next is None:
+                break
+            j_next, pt_next, _ = w_nodes[kw_next]
+            out.append({"kind": "W",
+                        "pts": _slice_path(Wc, w_nodes[kw][0], pt_leave,
+                                           j_next, pt_next,
+                                           wrap=(kw_next <= kw)),
+                        "enter": pt_leave, "leave": pt_next,
+                        "edge": w_nodes[kw][0]})
+            # ---- 回到图形边：找与该进入点重合的图形节点 ----
+            kp = _find_node(p_nodes, pt_next)
+            if kp is None:
+                break
+            if abs(pt_next[0] - start_pt[0]) < 1e-6 and \
+                    abs(pt_next[1] - start_pt[1]) < 1e-6:
+                break           # 回到起点 → 闭环
+            k = kp
+    return out
+
 
 # ---------------------------------------------------------------------
 # 步骤流

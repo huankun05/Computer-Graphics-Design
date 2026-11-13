@@ -99,6 +99,23 @@ def _px(seq):
     return {(int(p[0]), int(p[1])) for p in seq}
 
 
+def _gone(shape):
+    """图元上【已经被挖掉】的像素（守卫自带，不依赖实现里的新函数）。
+
+    = 橡皮擦点采样（shape.erased）∪ 区域裁剪的几何掩膜（shape.cuts）。
+    守卫要能在【旧代码】上跑出红色，所以这里不 import 实现里的
+    gone_pixels：自己按窗口掩膜算一遍。旧代码里区域裁剪还会把挖掉的
+    像素写进 erased，两者取并集后口径一致。
+    """
+    from algorithms.window_mask import polygon_mask
+    out = {(int(p[0]), int(p[1])) for p in (getattr(shape, "erased", None) or ())}
+    for poly in (getattr(shape, "cuts", None) or []):
+        verts = [(int(round(x)), int(round(y))) for x, y in poly]
+        if len(verts) >= 3:
+            out |= polygon_mask(verts)
+    return out
+
+
 # ---------------------------------------------------------------------
 # 用例矩阵：演示页 × 图元
 # ---------------------------------------------------------------------
@@ -151,11 +168,20 @@ def check_case(page_name, demo_cls, is_line_page, sname, make_shape):
     real_cut = {p for p in allpx if x0 <= p[0] <= x1 and y0 <= p[1] <= y1}
     real_kept = allpx - real_cut
 
-    # ---- C1：橙色参照层（待挖除）== 真实擦除集 ----
+    # ---- C1：裁剪页不产出【橙色参照层】----
+    # 用户反馈（2026-11-13）："被裁剪掉的部分就不用额外颜色显示，
+    # 显示画板颜色即可"。旧做法把"窗口内、将被裁掉"的像素整片染成
+    # 橙色：既像删除/保留区域对调，又把图形自己的边框一起盖掉——
+    # 窗口内那一段轮廓直接看不见了（用户反馈："显示不对啊"）。
     ref = _px(demo.reference_pixels())
-    ok(ref == real_cut,
-       f"{tag}: 橙色参照层 != 真实擦除集"
-       f"（多标 {len(ref - real_cut)} / 漏标 {len(real_cut - ref)}）")
+    ok(not ref,
+       f"{tag}: 裁剪页仍产出橙色参照层 {len(ref)} px"
+       f"（被裁掉的部分应直接显示画板颜色）")
+
+    # ---- C1b：画面上的像素只能越来越少（被挖掉的不许再出现）----
+    sizes = [len(_px(st.pixels) | _px(st.tint)) for st in steps]
+    ok(all(sizes[i] >= sizes[i + 1] for i in range(len(sizes) - 1)),
+       f"{tag}: 像素层不是单调递减（挖除过程不是渐进的）")
 
     # ---- C2：动画末帧 == 真实保留集 ----
     last = steps[-1]
@@ -316,7 +342,10 @@ def check_accumulate():
                    "wx1": _Spin(rect_a[2]), "wy1": _Spin(rect_a[3])}
     dv._regenerate(fit=False, autoplay=False)
     dv._finish_clip_playback()
-    after_a = set(shape.erased)
+    # "已经挖掉"的像素 = 橡皮擦点采样 ∪ 区域裁剪的几何掩膜
+    # （区域裁剪现在只走几何通道，不再混进 shape.erased）；
+    # 掩膜是"窗口这块区域"，与图元像素取交集才是真正被挖掉的像素。
+    after_a = _gone(shape) & allpx
     ok(after_a == cut_of(rect_a),
        f"第一轮裁剪结果不对（擦除 {len(after_a)} 像素）")
 
@@ -332,7 +361,7 @@ def check_accumulate():
        f"（A={len(cut_a)} B={len(cut_b)} 交集={len(cut_a & cut_b)}）")
     dv._regenerate(fit=False, autoplay=False)
     dv._finish_clip_playback()
-    after_b = set(shape.erased)
+    after_b = _gone(shape) & allpx
     ok(after_a <= after_b,
        f"第二次裁剪把第一次的结果冲掉了"
        f"（丢了 {len(after_a - after_b)} 个像素）")
@@ -342,7 +371,7 @@ def check_accumulate():
     ok(len(after_b) > len(after_a),
        f"第二次裁剪没有新增任何擦除（{len(after_b)} == {len(after_a)}）")
     # 第一轮窗口内的像素必须仍然是"已裁掉"
-    still = {p for p in cut_a if p in shape.erased}
+    still = {p for p in cut_a if p in (_gone(shape) & allpx)}
     ok(still == cut_a,
        f"第二次裁剪后第一轮窗口内的 {len(cut_a - still)} "
        f"个像素复活了")
@@ -450,11 +479,14 @@ def check_transform_after_clip():
         tool.rect = window
         tool.mode = "rect"
         tool._apply_all()
-        ok(bool(shape.erased),
-           f"{name}：裁剪没有挖掉任何像素")
         ok(bool(getattr(shape, "cuts", None)),
            f"{name}：裁剪没有记录几何窗口（cuts 为空）——"
            f"变换后被挖区域会漏格、残留黑散点")
+        ok(not getattr(shape, "erased", None),
+           f"{name}：区域裁剪把挖掉的像素混进了点采样通道（erased）——"
+           f"变换时按矩阵取整映射会与重新栅格化错开，"
+           f"误挖掉轮廓像素，图形边框出现缺口"
+           f"（用户反馈：\"边框也没有跟着图形走\"）")
 
         def leftovers(acc):
             """当前画出的像素里，落在【累计变换后的窗口】内的（应为 0）。
@@ -496,6 +528,69 @@ def check_transform_after_clip():
         ok(not left3,
            f"{name}：缩放 1.4 倍后，被裁掉的区域冒出 {len(left3)} 个黑散点")
 
+        cv.close()
+
+
+def check_crop_then_rotate_border():
+    """C12：裁剪后旋转，图形自己的【边框】必须跟着图形走。
+
+    用户反馈（2026-11-13）："旋转会出现这种情况，边框也没有跟着图形走"。
+
+    根因：区域裁剪过去把挖掉的像素 ALSO 写进 shape.erased（**点采样**），
+    变换时按矩阵取整映射；而图元变换后是**重新光栅化**的（圆/椭圆还
+    按协方差矩阵解析式重参数化）——两者不同源，映射后的采样点与新像素
+    错开，于是**误挖掉本该保留的轮廓像素**：图形边框上凭空出现缺口，
+    看着就是"边框留在原地、没跟着图形转"（实测多挖 16~17 个轮廓像素）。
+
+    现在区域裁剪只走 cuts（几何）一路，erased 只留给橡皮擦（像素级）。
+
+    守卫自带期望：另起一份**干净**图元，施加同一变换后重新栅格化，
+    再按变换后的窗口（同一矩阵、同一求交口径）扣掉——必须与实际画出
+    的像素完全一致（既不多画，也不少画）。旧代码上会少画十几个轮廓
+    像素 ⇒ 必红。
+    """
+    cases = [
+        ("椭圆", lambda: EllipseShape(kind=KIND_ELLIPSE, color=QColor("#222222"),
+                                      fill=True, center=(30, 20), rx=15, ry=9)),
+        ("多边形", lambda: PolygonShape(kind=KIND_POLYGON, fill=True,
+                                        color=QColor("#222222"),
+                                        vertices=[(14, 10), (44, 12), (40, 30),
+                                                  (16, 28)])),
+    ]
+    window = (30, 20, 46, 34)          # 右下角窗口
+    win_poly = [(window[0], window[1]), (window[2], window[1]),
+                (window[2], window[3]), (window[0], window[3])]
+
+    for name, make_shape in cases:
+        shape = make_shape()
+        cv = CanvasView()
+        cv.document.shapes.append(shape)
+        cv._render_base()
+        tool = ClipTool(cv)
+        cv.set_tool(tool)
+        tool.mode = "rect"
+        tool.rect = window
+        tool._apply_all()
+
+        cx, cy = shape.center if hasattr(shape, "center") else (29, 20)
+        m = tf.around((cx, cy), tf.rotation(30))
+        transform_shape(shape, m)
+
+        # 期望：干净图元施加同一变换后重新栅格化，再扣掉变换后窗口内的
+        ref = make_shape()
+        transform_shape(ref, m)
+        ro, rf = rasterize(ref)
+        expect = {(int(x), int(y)) for x, y in ro + rf} - _mask_float(
+            [tf.apply(m, v) for v in win_poly])
+
+        o, f = rasterize(shape)
+        actual = {(int(x), int(y)) for x, y in o + f}
+        missing = expect - actual          # 该保留却被挖掉（边框缺口）
+        extra = actual - expect            # 不该保留却留着
+        ok(not missing and not extra,
+           f"{name}：旋转 30° 后图形边框没有跟着图形走"
+           f"（被误挖 {len(missing)} 个像素，多留 {len(extra)} 个像素）"
+           f"——区域裁剪不能把挖除范围同时写进点采样通道")
         cv.close()
 
 
@@ -578,9 +673,9 @@ def check_polygon_window():
         real_kept = allpx - real_cut
 
         ref = _px(demo.reference_pixels())
-        ok(ref == real_cut,
-           f"{tag}: 橙色参照层 != 真实擦除集"
-           f"（多标 {len(ref - real_cut)} / 漏标 {len(real_cut - ref)}）")
+        ok(not ref,
+           f"{tag}: 裁剪页仍产出橙色参照层 {len(ref)} px"
+           f"（被裁掉的部分应直接显示画板颜色）")
 
         last = steps[-1]
         frame = _px(last.pixels) | _px(last.tint)
@@ -690,6 +785,10 @@ check_canvas_fill_contrast()
 print("-" * 64)
 print("变换后：被裁掉的区域必须仍然是干净的（不能冒黑散点）")
 check_transform_after_clip()
+
+print("-" * 64)
+print("变换后：图形自己的边框必须跟着图形走")
+check_crop_then_rotate_border()
 
 print("-" * 64)
 print("播放速度：裁剪页必须够慢（逐帧看得清判定过程）")

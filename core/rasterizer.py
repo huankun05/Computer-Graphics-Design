@@ -70,6 +70,26 @@ def _cut_mask(shape: Shape) -> frozenset:
     return mask
 
 
+def gone_pixels(shape: Shape) -> set:
+    """图元上**已经被挖掉**的像素 = 橡皮擦点采样 ∪ 区域裁剪的几何掩膜。
+
+    ★ 两条通道必须分工（用户反馈："旋转会出现这种情况，边框也没有跟着
+      图形走"）：
+      · 橡皮擦（shape.erased）= **像素级**语义，掩码必须精确等于被擦掉的
+        那几个像素，所以变换时按像素中心点映射；
+      · 区域裁剪（shape.cuts）= **几何**语义，"挖掉的是窗口这块区域"，
+        窗口随图元一起变换，渲染时按几何重新求交。
+    区域裁剪过去把挖掉的像素 ALSO 写进 erased，等于同一块区域用了两套
+    不同源的口径：点采样随矩阵取整映射后与重新栅格化的像素错开，
+    于是旋转后**误挖掉本该保留的轮廓像素**——图形边框上凭空出现缺口，
+    看起来就是"边框没有跟着图形走"（实测多挖 16~17 个轮廓像素）。
+    现在区域裁剪只走 cuts 一路，两种操作各归各的通道。
+    """
+    out = {(int(x), int(y)) for x, y in (getattr(shape, "erased", None) or ())}
+    out |= _cut_mask(shape)
+    return out
+
+
 def _apply_erased(shape: Shape, outline: List[Pixel],
                   fill: List[Pixel]) -> Tuple[List[Pixel], List[Pixel]]:
     """擦除掩码 + 裁剪窗口扣减：被擦除/被挖掉的像素不再输出。"""

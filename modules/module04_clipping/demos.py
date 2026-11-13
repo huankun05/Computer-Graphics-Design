@@ -37,8 +37,7 @@ from algorithms.liang_barsky import liang_barsky, liang_barsky_steps
 from algorithms.midpoint_clip import midpoint_clip, midpoint_clip_steps
 from algorithms.sutherland_hodgman import (clip_segment_convex_steps,
                                            is_convex)
-from algorithms.weiler_atherton import (clip_segment_steps,
-                                         clip_window_segments)
+from algorithms.weiler_atherton import clip_segment_steps
 from ui.widgets import SegmentedControl
 
 ALGO_COHEN = "cohen_sutherland"
@@ -99,16 +98,38 @@ def _alive_runs(px, erased):
     return runs
 
 
-def _outline_points(shape):
-    """任意图元 → 轮廓折线顶点（圆/椭圆取真实栅格轮廓像素）。"""
-    from core.shapes import CircleShape, EllipseShape, LineShape, PolygonShape
-    if isinstance(shape, LineShape):
-        return [tuple(shape.p0), tuple(shape.p1)]
-    if isinstance(shape, (CircleShape, EllipseShape)):
-        return _outline_pixels_sorted(shape)
-    if isinstance(shape, PolygonShape):
-        return [(int(x), int(y)) for x, y in shape.vertices]
-    return []
+def _peel_fill(seeds, pool, allowed):
+    """从被挖掉的轮廓像素出发，把紧邻的填充像素一并"擦掉"。
+
+    窗口内的填充是被轮廓围住的：轮廓被挖穿后，那块填充也就不再存在
+    （画布真实裁剪擦的是"轮廓∪填充 中落在窗口内的部分"）。这里做一次
+    4 邻域扩散，且只在窗口内扩散 ⇒ 被挖掉的边界往里"擦"，画面上就是
+    填充跟着边界一点点消失；而不是一上来把窗口内整块填充清掉——那样
+    画面中间会凭空空一大块，看着像"显示不对"。
+
+    seeds:   刚被挖掉的像素（轮廓）
+    pool:    当前还存在的填充像素
+    allowed: 窗口内的像素集合（扩散不能跑出窗口）
+    """
+    if not seeds or not pool:
+        return set()
+    out = set()
+    stack = []
+    # 种子是【刚被挖掉的轮廓像素】——它们本身不在填充集里，
+    # 要先看它们四周的填充像素，再从那里往里扩散。
+    for p in seeds:
+        x, y = int(p[0]), int(p[1])
+        for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if q in pool and q in allowed and q not in out:
+                out.add(q)
+                stack.append(q)
+    while stack:
+        x, y = stack.pop()
+        for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if q in pool and q in allowed and q not in out:
+                out.add(q)
+                stack.append(q)
+    return out
 
 
 class _ClipDemoBase:
@@ -404,7 +425,11 @@ class _ClipDemoBase:
         return dirty
 
     def reference_pixels(self):
-        """被窗口裁掉的部分（橙色参照层）；子类实现具体形状。"""
+        """初始态参照层（变换演示页用橙色叠层）；裁剪页不用，返回空。
+
+        裁剪页不画参照层：被裁掉的部分直接显示画板颜色即可
+        （用户反馈 2026-11-13），具体见 _LineClipDemo.reference_pixels。
+        """
         return []
 
 
@@ -421,18 +446,18 @@ class _LineClipDemo(_ClipDemoBase):
     _PIECE_LEN = 6
 
     def reference_pixels(self):
-        """窗口内的图元像素（橙色参照层 = 将被裁掉的部分）。
+        """裁剪页不产出【橙色参照层】——被裁掉的部分直接显示画板颜色。
 
-        取 rasterize 全部像素（轮廓 + 填充）− kept_pixels(窗口外)。
-        旧写法"原图 − 各段裁剪后线段"有个致命问题：填充像素压根不在
-        裁剪线段里，填充图形会整片进参照层——窗口外被染成橙色"将被删除"
-        的样子，看起来就是删除/保留区域对调（用户反馈）。参照层必须
-        严格落在窗口内（这块是要被裁掉的）。
+        用户反馈（2026-11-13）："被裁剪掉的部分就不用额外颜色显示，
+        显示画板颜色即可"。
+
+        旧做法是把"窗口内、将被裁掉"的像素整片染成橙色，看起来像
+        "删除/保留区域对调"，而且橙色盖在图形上会把图形自己的边框也
+        吃掉——窗口内那一段轮廓看不见了（用户反馈："显示不对啊"）。
+        现在改为：判定到哪、挖到哪，那块像素直接从画面上消失，露出
+        画板底色；"被裁掉"这件事由动画本身表达，而不是靠额外颜色。
         """
-        src = self.playback_source()
-        if src is None:
-            return []
-        return sorted(self.cut_pixels(self.window_vertices(self.collect()), src))
+        return []
 
     def _defs(self):
         return [("wx0", "窗口左", 20, -20, 120), ("wy0", "窗口上", 12, -20, 80),
@@ -476,16 +501,19 @@ class _LineClipDemo(_ClipDemoBase):
             每段又有几像素长——跨窗口边时能看清求交 / 二分 / 参数收窄
             （1~2 像素的微段每段一步就收敛，三页看起来几乎一样，用户反馈）。
 
-        已被裁掉的像素（shape.erased）不参与：同一个图形上做第二次裁剪时，
+        已被裁掉的像素不参与：同一个图形上做第二次裁剪时，
         判定要沿【剩下的】边界走，不能跨过上一轮挖空的缺口——否则紫色
         工作线段会横穿已经不存在的部分，判定轨迹就成了假的。
+        "已裁掉" = 橡皮擦点采样 ∪ 区域裁剪的几何掩膜（core.rasterizer.
+        gone_pixels）——区域裁剪现在只走几何通道，掩码不再混进 erased。
         """
         from algorithms.line_bresenham import bresenham_line
+        from core.rasterizer import gone_pixels
         from core.shapes import LineShape, PolygonShape
         src = self.playback_source()
         if src is None:
             return []
-        erased = set(getattr(src, "erased", None) or ())
+        erased = gone_pixels(src)
         if isinstance(src, LineShape):
             a = (int(src.p0[0]), int(src.p0[1]))
             b = (int(src.p1[0]), int(src.p1[1]))
@@ -533,11 +561,14 @@ class _LineClipDemo(_ClipDemoBase):
     def make_steps(self, params):
         """步骤流：沿图形边界逐段走，每段跑一遍本页算法并当场判定。
 
-        画面语义（固定三色，全模块统一）：
+        画面语义（固定两色 + 一条线，全模块统一）：
           蓝 = 还没被判定挖除的图元像素（窗口外最终留下的就是它）；
-          橙 = 窗口内将被挖除的部分（reference_pixels 橙色参照层，
-                随判定逐段露出来）；
+          淡蓝 = 图元的填充区（与轮廓分开画，边框才看得出来）；
           紫线 = 算法当前正在判定的那一段（本轮的工作线段）。
+        被判定挖除的像素直接从画面上消失，露出画板底色——不再用额外
+        颜色把"待挖除"区域整片染出来（用户反馈："被裁剪掉的部分就不
+        用额外颜色显示，显示画板颜色即可"；那样还会把图形自己的边框
+        一起盖掉，看着像"显示不对"）。
         每段判定完成的瞬间，落在窗口内的像素被挖掉——动画就是在原图
         基础上一步步裁掉窗口内的部分（用户反馈：要在原图基础上修改）。
         末帧 = 画布真实裁剪结果（"演完即所得"，播完那一瞬不跳变）。
@@ -598,11 +629,15 @@ class _LineClipDemo(_ClipDemoBase):
                         line_guide(lo, hi, GUIDE_MOVE, dash=True, width=2.6)]
                 if k == len(part) - 1 and cut:
                     # 本段判定完成 → 落在窗口内的部分被挖除；
-                    # 窗口内被轮廓围住的填充也随之消失（否则填满的
-                    # 图元会在窗口里留下一个洞，与画布真实裁剪对不上）
+                    # 紧邻它的窗口内填充随之被"擦掉"（像橡皮擦沿着
+                    # 边界往里擦），否则填满的图元会在窗口里留下
+                    # 一个洞，与画布真实裁剪对不上。
+                    # 早先是一上来就把窗口内【全部】填充清掉——画面
+                    # 中间凭空空一大块，看起来像"显示不对"。
                     current -= cut
-                    current -= fill_in
-                    fill_now -= fill_in
+                    peel = _peel_fill(cut, fill_now, mask)
+                    fill_now -= peel
+                    current -= peel
                 st.pixels = sorted(current)
                 st.tint = sorted(fill_now)
                 if multi:
@@ -1025,6 +1060,38 @@ class _PolyClipDemo(_LineClipDemo):
         """当前窗口能否用于本页算法（S-H 只支持凸窗口）。"""
         return True
 
+    def _outline_edges(self):
+        """主体轮廓 → 按"边"分组的有序点列（双边交替路径用）。
+
+        · 多边形 → 各条边（逐边 Bresenham，像素与画布栅格化完全一致，
+          判定轨迹与原图逐像素重合）；
+        · 圆/椭圆 → 真实栅格轮廓按极角排序后每 N 个切一段，段与段
+          **首尾相接**（拼起来正好是完整一圈）。
+
+        相邻两段必须首尾相接：双边交替路径要把各段拼成一条闭合折线，
+        段与段之间不能有缺口，否则求交得到的边界会横穿缺口。
+        """
+        from algorithms.line_bresenham import bresenham_line
+        from core.shapes import CircleShape, EllipseShape, PolygonShape
+        src = self.playback_source()
+        if src is None:
+            return []
+        if isinstance(src, PolygonShape):
+            pts = [(int(x), int(y)) for x, y in src.vertices]
+            out = []
+            for i in range(len(pts)):
+                a, b = pts[i], pts[(i + 1) % len(pts)]
+                if a == b:
+                    continue
+                out.append([(int(x), int(y)) for x, y in
+                            bresenham_line(a[0], a[1], b[0], b[1])])
+            return out
+        if isinstance(src, (CircleShape, EllipseShape)):
+            full = _outline_pixels_sorted(src, ignore_erased=True)
+            step = max(2, self._PIECE_LEN)
+            return [full[i:i + step + 1] for i in range(0, len(full), step)]
+        return []
+
     def make_steps(self, params):
         """窗口不适配本页算法时不出步骤（提示交给 empty_hint）。"""
         if not self._window_ok():
@@ -1121,37 +1188,125 @@ class PolygonClipWADemo(_PolyClipDemo):
                                    for px, py in window])
 
     def make_steps(self, params):
-        """在逐段判定之后，补一段"窗口的边落在主体内"的说明。
+        """双边交替：沿【图形边】↔【裁剪窗口边】交替前进。
 
-        交集边界由两类边交替组成：被裁多边形的边（落在窗口内的部分）
-        + 窗口的边（落在被裁多边形内的部分）。前者是前面逐段判定走过的，
-        后者就是"双边"的另一半——不画出来，这一页就只剩半个算法。
+        ★ 用户反馈（2026-11-13）："双边裁剪的动画应该是从图形窗口和
+          裁剪窗口两个边来走啊"。
+
+        W-A 的交集边界由两类段**交替**组成：
+          · P 段：图形边落在窗口内的部分（沿图形方向）→ 这条边的像素
+            被挖除；
+          · W 段：窗口边落在图形内的部分（沿窗口方向）→ 交集边界的
+            另一半（不挖任何像素，但要画出来）。
+
+        旧做法是"沿图形边逐段判定完，末尾再补一帧把窗口的边画出来"
+        ——那一帧是静态总结，看不出"交替"的过程，等于只演示了半个算法。
+        现在按真正的双边交替路径走：P 段 → W 段 → P 段 → W 段……
+
+        末帧仍然是画布真实裁剪结果（"演完即所得"）。
         """
-        steps = super().make_steps(params)
-        if not steps:
-            return steps
-        window = self.window_vertices(params)
+        from algorithms.steps import (GUIDE_MARK, GUIDE_MOVE, Step, line_guide)
+        from algorithms.weiler_atherton import wa_outline_path
+
+        self._pinned_source = self.playback_source()
         src = self._pinned_source
-        if src is None or len(window) < 3:
-            return steps
-        from algorithms.steps import (GUIDE_MARK, Step, line_guide,
-                                      polygon_guide)
-        subject = _outline_points(src)
-        if len(subject) < 3:
-            return steps
-        caps = clip_window_segments([(float(x), float(y)) for x, y in subject],
-                                    [(float(x), float(y)) for x, y in window])
-        if not caps:
-            return steps
-        guides = [self.window_guide(window)]
-        for a, b in caps:
-            guides.append(line_guide(a, b, GUIDE_MARK, dash=False, width=3.0))
-        last = steps[-1]
-        steps.append(Step(
-            list(last.pixels), dict(last.values),
-            f"双边的另一半：窗口的边落在主体内的 {len(caps)} 段"
-            "（交集边界由被裁多边形的边 + 窗口的边交替组成）",
-            guides=guides, tint=list(last.tint)))
+        if src is None:
+            return []
+        window = self.window_vertices(params)
+        if len(window) < 3:
+            return []
+        mask = self.window_mask(window)
+        if not mask:
+            return []
+
+        edges = self._outline_edges()
+        if not edges:
+            return []
+        path = wa_outline_path(
+            [[(float(x), float(y)) for x, y in e] for e in edges],
+            [(float(x), float(y)) for x, y in window])
+        if not path:
+            # 没有交点：图形整体在窗口内或整体在外，这一页没有可演示的
+            # 交替过程（提示交给 empty_hint）
+            return []
+
+        current = set(self.all_pixels(window))
+        fill_in = self.cut_fill_pixels(window)               # 窗口内填充（待挖除）
+        fill_now = set(self.kept_fill_pixels(window)) | fill_in
+        guide = self.window_guide(window)
+        base_guides = [guide] if guide else []
+
+        steps = [Step(sorted(current),
+                       {"阶段": "初始", "判定": "准备", "本段": "-",
+                        "进入点": "-", "离开点": "-", "段": "0"},
+                       "准备：交集边界由【图形边】与【裁剪窗口边】交替组成，"
+                       "下面一段一段交替走一遍",
+                       guides=list(base_guides), tint=sorted(fill_now))]
+
+        total = len(path)
+        for si, seg in enumerate(path, start=1):
+            kind = seg["kind"]
+            pts = seg["pts"]
+            if len(pts) < 2:
+                continue
+            step_len = max(2, self._PIECE_LEN)
+            for k in range(0, len(pts) - 1, step_len):
+                chunk = pts[k:k + step_len + 1]
+                if len(chunk) < 2:
+                    continue
+                a, b = chunk[0], chunk[-1]
+                if kind == "P":
+                    # 图形边：落在窗口内的像素被挖除
+                    cut = {(int(round(x)), int(round(y)))
+                           for x, y in chunk
+                           if (int(round(x)), int(round(y))) in mask}
+                    cut &= current
+                    current -= cut
+                    peel = _peel_fill(cut, fill_now, mask)
+                    fill_now -= peel
+                    current -= peel
+                    note = ("沿图形边前进：这一段落在裁剪窗口内 → 挖除"
+                            if cut else
+                            "沿图形边前进：这一段在窗口外 → 保留")
+                    vals = {"阶段": "图形边", "判定": "在窗口内 → 挖除"
+                            if cut else "在窗口外 → 保留",
+                            "本段": f"{len(cut)} 像素",
+                            "进入点": f"({seg['enter'][0]:.1f}, "
+                                     f"{seg['enter'][1]:.1f})",
+                            "离开点": f"({seg['leave'][0]:.1f}, "
+                                     f"{seg['leave'][1]:.1f})",
+                            "段": f"{si}/{total}"}
+                    guides = base_guides + [line_guide(a, b, GUIDE_MOVE,
+                                                       dash=True, width=2.6)]
+                else:
+                    # 窗口边：交集边界的另一半（不挖像素，只画出来）
+                    note = ("沿裁剪窗口边前进：窗口的边落在图形内 —— "
+                            "这是交集边界的另一半")
+                    vals = {"阶段": "窗口边", "判定": "窗口的边落在图形内",
+                            "本段": f"{len(chunk)} 个点",
+                            "进入点": f"({seg['enter'][0]:.1f}, "
+                                     f"{seg['enter'][1]:.1f})",
+                            "离开点": f"({seg['leave'][0]:.1f}, "
+                                     f"{seg['leave'][1]:.1f})",
+                            "段": f"{si}/{total}"}
+                    guides = base_guides + [line_guide(a, b, GUIDE_MARK,
+                                                       dash=False, width=3.0)]
+                steps.append(Step(sorted(current), vals, note,
+                                   guides=guides, tint=sorted(fill_now)))
+
+        # 兜底：窗口内还剩下的像素（交点处取整可能差一格）一并清掉，
+        # 末帧 = 画布真实裁剪结果（"演完即所得"）
+        leftover = {p for p in current if p in mask}
+        current -= leftover
+        fill_now -= leftover
+        current -= fill_in
+        fill_now -= fill_in
+        vals = dict(steps[-1].values) if steps else {}
+        vals.update({"阶段": "完成", "判定": "完成", "段": f"{total}/{total}"})
+        steps.append(Step(sorted(current), vals,
+                           "裁剪完成：交集边界 = 图形边的部分 + 窗口边的部分"
+                           "（两类边交替）",
+                           guides=list(base_guides), tint=sorted(fill_now)))
         return steps
 
 
